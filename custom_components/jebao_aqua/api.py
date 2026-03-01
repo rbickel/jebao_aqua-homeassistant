@@ -9,6 +9,8 @@ from .const import (
     TIMEOUT,
     LOGGER,
     LAN_PORT,
+    LAN_CONNECT_TIMEOUT,
+    LAN_COMMAND_TIMEOUT,
     GIZWITS_API_URLS,
     DEFAULT_REGION,
 )
@@ -39,8 +41,16 @@ class GizwitsApi:
 
     async def async_init_session(self):
         """Initialize the aiohttp session. Must be called before making API requests."""
+        if hasattr(self, '_session') and self._session and not self._session.closed:
+            return  # Session already active
         connector = aiohttp.TCPConnector(resolver=aiohttp.resolver.ThreadedResolver())
         self._session = aiohttp.ClientSession(connector=connector)
+
+    async def _ensure_session(self):
+        """Ensure the aiohttp session is open, recreating if needed."""
+        if not hasattr(self, '_session') or self._session is None or self._session.closed:
+            LOGGER.warning("API session was closed, recreating...")
+            await self.async_init_session()
 
     async def __aenter__(self):
         await self.async_init_session()
@@ -131,6 +141,7 @@ class GizwitsApi:
 
     async def get_devices(self):
         """Get a list of bound devices."""
+        await self._ensure_session()
         headers = {
             "X-Gizwits-User-token": self._token,
             "X-Gizwits-Application-Id": GIZWITS_APP_ID,
@@ -156,6 +167,7 @@ class GizwitsApi:
 
     async def get_device_data(self, device_id: str):
         """Get the latest attribute status values from a device."""
+        await self._ensure_session()
         url = self.device_data_url.format(device_id=device_id)
         LOGGER.debug("Trying to get device data from URL: %s", url)
         headers = {
@@ -198,6 +210,7 @@ class GizwitsApi:
             headers,
         )
 
+        await self._ensure_session()
         try:
             async with self._session.post(
                 url, json=data, headers=headers, timeout=TIMEOUT
@@ -221,7 +234,7 @@ class GizwitsApi:
             )
             return None
 
-    async def _read_gizwits_frame(self, reader, timeout=5.0):
+    async def _read_gizwits_frame(self, reader):
         """Read a complete Gizwits LAN protocol frame from the stream.
 
         Frame format: [4-byte header 00000003] [LEB128 length] [length bytes of data]
@@ -229,7 +242,7 @@ class GizwitsApi:
         """
         try:
             # Read 4-byte header
-            header = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+            header = await asyncio.wait_for(reader.readexactly(4), timeout=LAN_COMMAND_TIMEOUT)
             if header != b"\x00\x00\x00\x03":
                 LOGGER.warning("Unexpected Gizwits frame header: %s", header.hex())
                 return None
@@ -240,7 +253,7 @@ class GizwitsApi:
             leb_bytes = b""
             while True:
                 byte_data = await asyncio.wait_for(
-                    reader.readexactly(1), timeout=timeout
+                    reader.readexactly(1), timeout=LAN_COMMAND_TIMEOUT
                 )
                 leb_bytes += byte_data
                 byte_val = byte_data[0]
@@ -254,7 +267,7 @@ class GizwitsApi:
 
             # Read exactly 'length' bytes of frame data
             data = await asyncio.wait_for(
-                reader.readexactly(length), timeout=timeout
+                reader.readexactly(length), timeout=LAN_COMMAND_TIMEOUT
             )
 
             frame = header + leb_bytes + data
@@ -334,8 +347,11 @@ class GizwitsApi:
         )
 
         try:
-            # Establish a connection with the local device
-            reader, writer = await asyncio.open_connection(device_ip, LAN_PORT)
+            # Establish a connection with the local device (with timeout)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(device_ip, LAN_PORT),
+                timeout=LAN_CONNECT_TIMEOUT,
+            )
 
             try:
                 # Step 1: Request device info (cmd 0x0006 → response 0x0007)

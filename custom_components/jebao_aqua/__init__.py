@@ -10,7 +10,7 @@ from pathlib import Path
 from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
 from homeassistant.helpers.device_registry import async_get as async_get_device_registry
 
-from .const import DOMAIN, PLATFORMS, UPDATE_INTERVAL, LOGGER, GIZWITS_API_URLS
+from .const import DOMAIN, PLATFORMS, UPDATE_INTERVAL, LOGGER, GIZWITS_API_URLS, MAX_LAN_FAILURES
 from .api import GizwitsApi
 from .discovery import discover_devices
 from .helpers import is_device_data_valid  # Add this import
@@ -120,6 +120,7 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
         self.device_inventory = []
         self.device_data = {}
         self._device_update_locks = {}  # Add locks per device
+        self._lan_failure_counts = {}  # Track consecutive LAN failures per device
 
     async def fetch_initial_device_list(self, entry: ConfigEntry):
         """Fetch the initial list of devices and add LAN IPs."""
@@ -148,7 +149,7 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
             LOGGER.error(f"Error fetching initial device list: {e}")
 
     async def get_device_data(self, device_id):
-        """Get device data either locally or from the cloud with lock protection."""
+        """Get device data locally with cloud fallback, with lock protection."""
         # Get or create lock for this device
         if device_id not in self._device_update_locks:
             self._device_update_locks[device_id] = asyncio.Lock()
@@ -162,16 +163,51 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                 ),
                 None,
             )
-            if device_info and "lan_ip" in device_info:
+
+            data = None
+            lan_ip = device_info.get("lan_ip") if device_info else None
+            lan_failures = self._lan_failure_counts.get(device_id, 0)
+
+            # Try LAN first if IP is available and not in backoff
+            if device_info and lan_ip and lan_failures < MAX_LAN_FAILURES:
                 LOGGER.debug(
-                    f"Getting local data for device {device_id} at {device_info['lan_ip']}"
+                    f"Getting local data for device {device_id} at {lan_ip}"
                 )
                 data = await self.api.get_local_device_data(
-                    device_info["lan_ip"], device_info["product_key"], device_id
+                    lan_ip, device_info["product_key"], device_id
                 )
-            else:
+                if data:
+                    # LAN success — reset failure counter
+                    self._lan_failure_counts[device_id] = 0
+                else:
+                    # LAN failed — increment counter
+                    self._lan_failure_counts[device_id] = lan_failures + 1
+                    LOGGER.warning(
+                        "LAN poll failed for %s (%d/%d), falling back to cloud",
+                        device_id,
+                        self._lan_failure_counts[device_id],
+                        MAX_LAN_FAILURES,
+                    )
+            elif lan_ip and lan_failures >= MAX_LAN_FAILURES:
+                LOGGER.debug(
+                    "LAN disabled for %s after %d failures, using cloud. "
+                    "Will retry LAN after a successful cloud poll.",
+                    device_id,
+                    lan_failures,
+                )
+
+            # Cloud fallback (or primary if no LAN IP)
+            if data is None:
                 LOGGER.debug(f"Getting cloud data for device {device_id}")
                 data = await self.api.get_device_data(device_id)
+                if data and lan_failures >= MAX_LAN_FAILURES:
+                    # Cloud succeeded after LAN backoff — reset LAN counter
+                    # so we retry LAN next cycle
+                    LOGGER.info(
+                        "Cloud poll succeeded for %s, resetting LAN failure counter",
+                        device_id,
+                    )
+                    self._lan_failure_counts[device_id] = 0
 
             if data:
                 LOGGER.debug(f"Got data for device {device_id}: {data}")
@@ -195,12 +231,12 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                     return device_id, self.device_data[device_id]
                 else:
                     LOGGER.warning(f"No valid data for device {device_id}")
-                    return None, None
+                    return device_id, None
             except Exception as e:
                 LOGGER.error(f"Error updating device {device_id}: {e}")
                 if device_id in self.device_data:
                     return device_id, self.device_data[device_id]
-                return None, None
+                return device_id, None
 
         # Create tasks for all devices
         tasks = []
@@ -212,19 +248,24 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=False)
 
-            # Process results and log them
+            # Process results — always preserve device_id in new_data
             for device_id, data in results:
                 if device_id and data:
                     new_data[device_id] = data
                     LOGGER.debug(
                         f"Successfully updated device {device_id} with data: {data}"
                     )
+                elif device_id and device_id in self.device_data:
+                    # Preserve last known good data so entity stays available
+                    new_data[device_id] = self.device_data[device_id]
+                    LOGGER.warning(
+                        f"Preserving cached data for device {device_id}"
+                    )
 
         if not new_data:
             LOGGER.error("No device data was updated successfully")
-            # Instead of raising UpdateFailed, return last known good data if available
             if self.device_data:
-                LOGGER.warning("Using last known good data")
+                LOGGER.warning("Using last known good data for all devices")
                 return self.device_data
             raise UpdateFailed("Failed to update any devices")
 
