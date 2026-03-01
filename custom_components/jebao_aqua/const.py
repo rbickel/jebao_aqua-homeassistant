@@ -41,7 +41,7 @@ LAN_PORT = 12416
 # Update interval
 from datetime import timedelta
 
-UPDATE_INTERVAL = timedelta(seconds=5)
+UPDATE_INTERVAL = timedelta(seconds=3)
 
 # Maximum consecutive LAN failures before falling back to cloud
 MAX_LAN_FAILURES = 3
