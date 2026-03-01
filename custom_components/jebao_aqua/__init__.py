@@ -70,45 +70,46 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         token=token,
     )
 
-    async with api:
-        api.add_attribute_models(attribute_models)
-        coordinator = GizwitsDataUpdateCoordinator(hass, api)
-        await coordinator.fetch_initial_device_list(entry)
+    await api.async_init_session()
+    api.add_attribute_models(attribute_models)
+    coordinator = GizwitsDataUpdateCoordinator(hass, api)
+    await coordinator.fetch_initial_device_list(entry)
 
-        try:
-            await coordinator.async_config_entry_first_refresh()
-        except Exception as err:
-            LOGGER.error("Error setting up entry: %s", err)
-            raise ConfigEntryNotReady from err
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception as err:
+        LOGGER.error("Error setting up entry: %s", err)
+        await api.close()
+        raise ConfigEntryNotReady from err
 
-        hass.data[DOMAIN][entry.entry_id] = {
-            "api": api,
-            "coordinator": coordinator,
-            "attribute_models": attribute_models,
-        }
+    hass.data[DOMAIN][entry.entry_id] = {
+        "api": api,
+        "coordinator": coordinator,
+        "attribute_models": attribute_models,
+    }
 
-        # Auto-discover devices and update config entry if needed
-        if entry.data.get("auto_discover", True):  # Default to True if not specified
-            discovered_devices = await discover_devices()
-            if discovered_devices:
-                hass.data[DOMAIN][entry.entry_id]["discovered_devices"] = (
-                    discovered_devices
-                )
-                LOGGER.debug(f"Discovered devices during setup: {discovered_devices}")
+    # Auto-discover devices and update config entry if needed
+    if entry.data.get("auto_discover", True):  # Default to True if not specified
+        discovered_devices = await discover_devices()
+        if discovered_devices:
+            hass.data[DOMAIN][entry.entry_id]["discovered_devices"] = (
+                discovered_devices
+            )
+            LOGGER.debug(f"Discovered devices during setup: {discovered_devices}")
 
-                # Update coordinator's device inventory with discovered IPs
-                for device in coordinator.device_inventory:
-                    device_id = device.get("did")
-                    if device_id in discovered_devices:
-                        device["lan_ip"] = discovered_devices[device_id]
-                        LOGGER.debug(
-                            f"Updated device {device_id} with discovered IP {discovered_devices[device_id]}"
-                        )
+            # Update coordinator's device inventory with discovered IPs
+            for device in coordinator.device_inventory:
+                device_id = device.get("did")
+                if device_id in discovered_devices:
+                    device["lan_ip"] = discovered_devices[device_id]
+                    LOGGER.debug(
+                        f"Updated device {device_id} with discovered IP {discovered_devices[device_id]}"
+                    )
 
-        # Replace multiple async_forward_entry_setup calls with single async_forward_entry_setups
-        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Replace multiple async_forward_entry_setup calls with single async_forward_entry_setups
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-        return True
+    return True
 
 
 class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
@@ -270,8 +271,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             for device_id in devices:
                 dev_reg.async_remove_device(device_id)
 
-            # Clean up hass.data
+            # Clean up hass.data and close API session
             if DOMAIN in hass.data and entry.entry_id in hass.data[DOMAIN]:
+                api = hass.data[DOMAIN][entry.entry_id].get("api")
+                if api:
+                    await api.close()
                 hass.data[DOMAIN].pop(entry.entry_id)
 
         return unload_ok
