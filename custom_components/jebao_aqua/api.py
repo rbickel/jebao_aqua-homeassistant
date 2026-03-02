@@ -9,6 +9,8 @@ from .const import (
     TIMEOUT,
     LOGGER,
     LAN_PORT,
+    LAN_CONNECT_TIMEOUT,
+    LAN_COMMAND_TIMEOUT,
     GIZWITS_API_URLS,
     DEFAULT_REGION,
 )
@@ -37,16 +39,25 @@ class GizwitsApi:
         self.device_data_url = device_data_url
         self.control_url = control_url
 
+    async def async_init_session(self):
+        """Initialize the aiohttp session. Must be called before making API requests."""
+        if hasattr(self, '_session') and self._session and not self._session.closed:
+            return  # Session already active
+        connector = aiohttp.TCPConnector(resolver=aiohttp.resolver.ThreadedResolver())
+        self._session = aiohttp.ClientSession(connector=connector)
+
+    async def _ensure_session(self):
+        """Ensure the aiohttp session is open, recreating if needed."""
+        if not hasattr(self, '_session') or self._session is None or self._session.closed:
+            LOGGER.warning("API session was closed, recreating...")
+            await self.async_init_session()
+
     async def __aenter__(self):
-        self._session = await aiohttp.ClientSession().__aenter__()
+        await self.async_init_session()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self._session.__aexit__(exc_type, exc_val, exc_tb)
-
-    async def get_session(self):
-        """Create and return a new aiohttp ClientSession."""
-        return aiohttp.ClientSession()
+        await self.close()
 
     async def async_login(self, email: str, password: str) -> Tuple[str, str]:
         """Login to Gizwits and return the token and any error code.
@@ -130,6 +141,7 @@ class GizwitsApi:
 
     async def get_devices(self):
         """Get a list of bound devices."""
+        await self._ensure_session()
         headers = {
             "X-Gizwits-User-token": self._token,
             "X-Gizwits-Application-Id": GIZWITS_APP_ID,
@@ -155,6 +167,7 @@ class GizwitsApi:
 
     async def get_device_data(self, device_id: str):
         """Get the latest attribute status values from a device."""
+        await self._ensure_session()
         url = self.device_data_url.format(device_id=device_id)
         LOGGER.debug("Trying to get device data from URL: %s", url)
         headers = {
@@ -197,30 +210,125 @@ class GizwitsApi:
             headers,
         )
 
-        # Create a new session for the control command
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(
-                    url, json=data, headers=headers, timeout=TIMEOUT
-                ) as response:
-                    result = await response.text()
-                    LOGGER.debug(
-                        "Response from Gizwits API to Control Command - Device Data: %s",
-                        result,
-                    )
-                    if response.status == 200:
-                        return json.loads(result)
-                    else:
-                        LOGGER.error(
-                            "Failed to send control command to Gizwits API: %s",
-                            response.status,
-                        )
-                        return None
-            except Exception as e:
-                LOGGER.error(
-                    "Exception while sending control command to Gizwits API: %s", e
+        await self._ensure_session()
+        try:
+            async with self._session.post(
+                url, json=data, headers=headers, timeout=TIMEOUT
+            ) as response:
+                result = await response.text()
+                LOGGER.debug(
+                    "Response from Gizwits API to Control Command - Device Data: %s",
+                    result,
                 )
+                if response.status == 200:
+                    return json.loads(result)
+                else:
+                    LOGGER.error(
+                        "Failed to send control command to Gizwits API: %s",
+                        response.status,
+                    )
+                    return None
+        except Exception as e:
+            LOGGER.error(
+                "Exception while sending control command to Gizwits API: %s", e
+            )
+            return None
+
+    async def _read_gizwits_frame(self, reader):
+        """Read a complete Gizwits LAN protocol frame from the stream.
+
+        Frame format: [4-byte header 00000003] [LEB128 length] [length bytes of data]
+        Returns the complete frame as bytes, or None on error/EOF.
+        """
+        try:
+            # Read 4-byte header
+            header = await asyncio.wait_for(reader.readexactly(4), timeout=LAN_COMMAND_TIMEOUT)
+            if header != b"\x00\x00\x00\x03":
+                LOGGER.warning("Unexpected Gizwits frame header: %s", header.hex())
                 return None
+
+            # Read LEB128-encoded length byte by byte
+            length = 0
+            shift = 0
+            leb_bytes = b""
+            while True:
+                byte_data = await asyncio.wait_for(
+                    reader.readexactly(1), timeout=LAN_COMMAND_TIMEOUT
+                )
+                leb_bytes += byte_data
+                byte_val = byte_data[0]
+                length |= (byte_val & 0x7F) << shift
+                if (byte_val & 0x80) == 0:
+                    break
+                shift += 7
+                if shift > 35:  # Safety limit for LEB128
+                    LOGGER.error("LEB128 length exceeds safety limit")
+                    return None
+
+            # Read exactly 'length' bytes of frame data
+            data = await asyncio.wait_for(
+                reader.readexactly(length), timeout=LAN_COMMAND_TIMEOUT
+            )
+
+            frame = header + leb_bytes + data
+            return frame
+        except asyncio.TimeoutError:
+            LOGGER.warning("Timeout reading Gizwits frame")
+            return None
+        except asyncio.IncompleteReadError as e:
+            LOGGER.warning("Incomplete read on Gizwits frame: %s", e)
+            return None
+        except Exception as e:
+            LOGGER.error("Error reading Gizwits frame: %s", e)
+            return None
+
+    def _get_frame_command(self, frame):
+        """Extract the 2-byte command code from a Gizwits frame.
+
+        Returns the command as an int (e.g. 0x0007, 0x0009, 0x0094), or None.
+        """
+        if not frame or len(frame) < 8:
+            return None
+        # Skip header (4 bytes), then decode LEB128 to find data start
+        idx = 4
+        while idx < len(frame) and (frame[idx] & 0x80):
+            idx += 1
+        idx += 1  # past the last LEB128 byte
+        # data starts at idx: flag (1 byte) + command (2 bytes) + payload
+        if idx + 3 <= len(frame):
+            return int.from_bytes(frame[idx + 1 : idx + 3], byteorder="big")
+        return None
+
+    async def _read_response_for_command(self, reader, expected_cmd, max_frames=5):
+        """Read Gizwits frames until one with the expected command is found.
+
+        Discards frames with non-matching commands (e.g. heartbeats).
+        Returns the matching frame, or None if not found within max_frames.
+        """
+        for attempt in range(max_frames):
+            frame = await self._read_gizwits_frame(reader)
+            if frame is None:
+                return None
+            cmd = self._get_frame_command(frame)
+            LOGGER.debug(
+                "Read frame #%d: cmd=0x%04x, data=%s",
+                attempt + 1,
+                cmd if cmd else 0,
+                frame.hex(),
+            )
+            if cmd == expected_cmd:
+                return frame
+            LOGGER.debug(
+                "Discarding frame with cmd 0x%04x (expected 0x%04x)",
+                cmd if cmd else 0,
+                expected_cmd,
+            )
+        LOGGER.warning(
+            "Expected response 0x%04x not received after %d frames",
+            expected_cmd,
+            max_frames,
+        )
+        return None
 
     async def get_local_device_data(self, device_ip, product_key, device_id):
         """Poll the local device for its status."""
@@ -239,23 +347,48 @@ class GizwitsApi:
         )
 
         try:
-            # Establish a connection with the local device
-            reader, writer = await asyncio.open_connection(device_ip, LAN_PORT)
+            # Establish a connection with the local device (with timeout)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(device_ip, LAN_PORT),
+                timeout=LAN_CONNECT_TIMEOUT,
+            )
 
             try:
-                # Perform necessary commands to retrieve device data
+                # Step 1: Request device info (cmd 0x0006 → response 0x0007)
                 await self._send_local_command(writer, b"\x00\x06")
-                response = await reader.read(1024)
-                binding_key = response[-12:]
+                frame = await self._read_response_for_command(reader, 0x0007)
+                if frame is None:
+                    LOGGER.error(
+                        "No device info response (0x0007) from %s", device_id
+                    )
+                    return None
+                binding_key = frame[-12:]
+                LOGGER.debug("Binding key for %s: %s", device_id, binding_key.hex())
+
+                # Step 2: Send binding/login (cmd 0x0008 → response 0x0009)
                 await self._send_local_command(writer, b"\x00\x08", binding_key)
-                await reader.read(1024)
+                frame = await self._read_response_for_command(reader, 0x0009)
+                if frame is None:
+                    LOGGER.error(
+                        "No binding response (0x0009) from %s", device_id
+                    )
+                    return None
+                LOGGER.debug("Binding ACK for %s: %s", device_id, frame.hex())
+
+                # Step 3: Request device status (cmd 0x0093 → response 0x0094)
                 await self._send_local_command(
                     writer, b"\x00\x93", b"\x00\x00\x00\x02\x02"
                 )
-                response = await reader.read(1024)
+                response = await self._read_response_for_command(reader, 0x0094)
+                if response is None:
+                    LOGGER.error(
+                        "No status response (0x0094) from %s", device_id
+                    )
+                    return None
 
-                # Debug log the response in hex format
-                LOGGER.debug("Response after sending command 0x93: %s", response.hex())
+                LOGGER.debug(
+                    "Status response for %s: %s", device_id, response.hex()
+                )
 
                 # Process the response
                 device_status_payload = self._extract_device_status_payload(response)
@@ -313,9 +446,16 @@ class GizwitsApi:
             raise
 
     def _extract_device_status_payload(self, response):
-        """Extract the device status payload from the response."""
+        """Extract the device status payload from the response.
+
+        Gizwits LAN frame structure after header + LEB128 length:
+          [flag 1B][cmd 2B][sn 4B]
+          [if flag & 0x01: did_len 2B + did (did_len B)]
+          [action 1B]
+          [device status payload ...]
+        """
         try:
-            # Find the pattern 0x00 0x00 0x00 0x03 in the response, this is marker for start of gizwits message
+            # Find the pattern 0x00 0x00 0x00 0x03 in the response
             pattern = b"\x00\x00\x00\x03"
             start_index = response.find(pattern)
             if start_index == -1:
@@ -324,7 +464,7 @@ class GizwitsApi:
                 )
                 return None
 
-            # Start evaluating bytes after the pattern for LEB128 encoded length
+            # Decode LEB128 length after the header
             leb128_bytes = response[start_index + len(pattern) :]
             length, leb128_length = self._decode_leb128(leb128_bytes)
             if length is None:
@@ -333,16 +473,53 @@ class GizwitsApi:
                 )
                 return None
 
-            # Subtract 8 from the decoded length to get the device status payload length
-            N = length - 8
+            # Data portion starts after header + LEB128 bytes
+            data_start = start_index + len(pattern) + leb128_length
+            data = response[data_start : data_start + length]
 
-            if N > 0 and N <= len(response):
-                # Extract the last N bytes as the device status payload
-                device_status_payload = response[-N:]
-                return device_status_payload
-            else:
-                LOGGER.error("Invalid device status payload length: %s", N)
+            if len(data) < 8:
+                LOGGER.error("Frame data too short: %d bytes", len(data))
                 return None
+
+            # Parse frame fields: flag(1) + cmd(2) + sn(4)
+            flag = data[0]
+            offset = 7  # past flag(1) + cmd(2) + sn(4)
+
+            # If flag bit 0 is set, the frame includes a DID (device ID) field
+            if flag & 0x01:
+                if offset + 2 > len(data):
+                    LOGGER.error("Frame too short for DID length field")
+                    return None
+                did_len = int.from_bytes(data[offset : offset + 2], byteorder="big")
+                offset += 2 + did_len
+                LOGGER.debug(
+                    "Frame has DID field (flag=0x%02x), DID length: %d, "
+                    "skipping to data offset %d",
+                    flag,
+                    did_len,
+                    offset,
+                )
+
+            # Next byte is the action byte
+            if offset >= len(data):
+                LOGGER.error("Frame too short for action byte")
+                return None
+            offset += 1  # skip the action byte
+
+            # Everything from offset onward is the device status payload
+            device_status_payload = data[offset:]
+
+            if len(device_status_payload) == 0:
+                LOGGER.error("Empty device status payload")
+                return None
+
+            LOGGER.debug(
+                "Extracted device status payload (%d bytes, flag=0x%02x): %s",
+                len(device_status_payload),
+                flag,
+                device_status_payload[:20].hex() + ("..." if len(device_status_payload) > 20 else ""),
+            )
+            return device_status_payload
         except Exception as e:
             LOGGER.error(f"Error in extracting device status payload: {e}")
             return None

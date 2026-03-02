@@ -33,13 +33,18 @@ GIZWITS_API_URLS = {
 
 TIMEOUT = 10
 DISCOVERY_TIMEOUT = 5  # seconds
+LAN_CONNECT_TIMEOUT = 5  # seconds - timeout for TCP connection to local device
+LAN_COMMAND_TIMEOUT = 5  # seconds - timeout for reading a single frame
 
 LAN_PORT = 12416
 
 # Update interval
 from datetime import timedelta
 
-UPDATE_INTERVAL = timedelta(seconds=2)
+UPDATE_INTERVAL = timedelta(seconds=3)
+
+# Maximum consecutive LAN failures before falling back to cloud
+MAX_LAN_FAILURES = 3
 
 # Platform types
 PLATFORMS = ["switch", "sensor", "select", "number"]
