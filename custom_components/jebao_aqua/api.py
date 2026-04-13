@@ -21,6 +21,10 @@ GIZWITS_ERROR_CODES = {
 }
 
 
+class TokenExpiredError(Exception):
+    """Raised when the Gizwits API returns a token-invalid error (9004)."""
+
+
 class GizwitsApi:
     """Class to handle communication with the Gizwits API."""
 
@@ -218,11 +222,24 @@ class GizwitsApi:
                 LOGGER.debug("Response from Gizwits API: %s", result)
                 if response.status == 200:
                     return json.loads(result)
+                elif response.status == 400:
+                    try:
+                        err = json.loads(result)
+                        if err.get("error_code") == 9004:
+                            raise TokenExpiredError("Token invalid (9004)")
+                    except (json.JSONDecodeError, TokenExpiredError):
+                        raise
+                    LOGGER.error(
+                        "Failed to fetch devices from Gizwits API: %s - %s", response.status, result
+                    )
+                    return None
                 else:
                     LOGGER.error(
                         "Failed to fetch devices from Gizwits API: %s", response.status
                     )
                     return None
+        except TokenExpiredError:
+            raise
         except Exception as e:
             LOGGER.error("Exception while fetching devices from Gizwits API: %s", e)
             return None
@@ -245,12 +262,26 @@ class GizwitsApi:
                 LOGGER.debug("Response from Gizwits API - Device Data: %s", result)
                 if response.status == 200:
                     return json.loads(result)
+                elif response.status == 400:
+                    try:
+                        err = json.loads(result)
+                        if err.get("error_code") == 9004:
+                            raise TokenExpiredError("Token invalid (9004)")
+                    except (json.JSONDecodeError, TokenExpiredError):
+                        raise
+                    LOGGER.error(
+                        "Failed to fetch device data from Gizwits API: %s - %s",
+                        response.status, result,
+                    )
+                    return None
                 else:
                     LOGGER.error(
                         "Failed to fetch device data from Gizwits API: %s",
                         response.status,
                     )
                     return None
+        except TokenExpiredError:
+            raise
         except Exception as e:
             LOGGER.error("Exception while fetching device data from Gizwits API: %s", e)
             return None
@@ -284,12 +315,26 @@ class GizwitsApi:
                 )
                 if response.status == 200:
                     return json.loads(result)
+                elif response.status == 400:
+                    try:
+                        err = json.loads(result)
+                        if err.get("error_code") == 9004:
+                            raise TokenExpiredError("Token invalid (9004)")
+                    except (json.JSONDecodeError, TokenExpiredError):
+                        raise
+                    LOGGER.error(
+                        "Failed to send control command to Gizwits API: %s - %s",
+                        response.status, result,
+                    )
+                    return None
                 else:
                     LOGGER.error(
                         "Failed to send control command to Gizwits API: %s",
                         response.status,
                     )
                     return None
+        except TokenExpiredError:
+            raise
         except Exception as e:
             LOGGER.error(
                 "Exception while sending control command to Gizwits API: %s", e

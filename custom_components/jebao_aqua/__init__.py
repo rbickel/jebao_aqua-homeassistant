@@ -12,7 +12,7 @@ from homeassistant.helpers.entity_registry import async_get as async_get_entity_
 from homeassistant.helpers.device_registry import async_get as async_get_device_registry
 
 from .const import DOMAIN, PLATFORMS, UPDATE_INTERVAL, LOGGER, GIZWITS_API_URLS, MAX_LAN_FAILURES, TOKEN_REFRESH_MARGIN
-from .api import GizwitsApi
+from .api import GizwitsApi, TokenExpiredError
 from .discovery import discover_devices
 from .helpers import is_device_data_valid  # Add this import
 
@@ -153,6 +153,18 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
         """Fetch the initial list of devices and add LAN IPs."""
         try:
             response = await self.api.get_devices()
+        except TokenExpiredError:
+            LOGGER.warning("Token expired while fetching device list, attempting recovery")
+            if await self._maybe_refresh_token(force=True):
+                response = await self.api.get_devices()
+            else:
+                LOGGER.error("Cannot fetch devices — token expired and recovery failed")
+                return
+        except Exception as e:
+            LOGGER.error(f"Error fetching initial device list: {e}")
+            return
+
+        try:
             if response and "devices" in response:
                 self.device_inventory = response["devices"]
 
@@ -175,23 +187,31 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as e:
             LOGGER.error(f"Error fetching initial device list: {e}")
 
-    async def _maybe_refresh_token(self):
-        """Check if the cloud token is near expiry and refresh it."""
+    async def _maybe_refresh_token(self, force=False):
+        """Check if the cloud token is near expiry and refresh it.
+
+        Args:
+            force: If True, refresh immediately regardless of expiry time.
+                   Used when an API call gets a token-invalid error.
+        """
         if self._lan_only or not self._entry:
-            return
+            return False
 
         expires_at = self._entry.data.get("token_expires_at")
-        if not expires_at:
-            return
 
-        remaining = expires_at - time.time()
-        if remaining > TOKEN_REFRESH_MARGIN:
-            return  # Token still has plenty of time
+        if not force and expires_at:
+            remaining = expires_at - time.time()
+            if remaining > TOKEN_REFRESH_MARGIN:
+                return False  # Token still has plenty of time
 
-        LOGGER.info(
-            "Cloud token expires in %.1f days, attempting refresh",
-            remaining / 86400,
-        )
+        if force:
+            LOGGER.warning("Cloud token rejected by API, attempting recovery")
+        else:
+            remaining = (expires_at - time.time()) if expires_at else 0
+            LOGGER.info(
+                "Cloud token expires in %.1f days, attempting refresh",
+                remaining / 86400,
+            )
 
         # First, try the refresh token (single-use, no new refresh token returned)
         refresh_token = self._entry.data.get("refresh_token")
@@ -206,7 +226,7 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                     self._entry, data=new_data
                 )
                 LOGGER.info("Token refreshed via refresh_token, new expiry: %s", result["expires_at"])
-                return
+                return True
 
         # Refresh token unavailable or failed — re-login with stored credentials
         email = self._entry.data.get("email")
@@ -223,9 +243,10 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                     self._entry, data=new_data
                 )
                 LOGGER.info("Re-authenticated successfully, new token expires at %s", login_result["expires_at"])
-                return
+                return True
 
         LOGGER.warning("Unable to refresh token — no refresh token or stored credentials available")
+        return False
 
     async def get_device_data(self, device_id):
         """Get device data locally with cloud fallback, with lock protection."""
@@ -295,27 +316,32 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         """Fetch the latest status for each device."""
         await self._maybe_refresh_token()
+
+        try:
+            return await self._do_update_devices()
+        except TokenExpiredError:
+            LOGGER.warning("Token expired during update, attempting recovery")
+            if await self._maybe_refresh_token(force=True):
+                return await self._do_update_devices()
+            raise UpdateFailed("Token expired and could not be refreshed")
+
+    async def _do_update_devices(self):
+        """Fetch data for all devices (called by _async_update_data)."""
         new_data = {}
 
         async def update_single_device(device_id: str):
             """Update a single device's data."""
-            try:
-                device_data = await self.get_device_data(device_id)
-                if device_data and isinstance(device_data.get("attr"), dict):
-                    LOGGER.debug(
-                        f"Got fresh data for device {device_id}: {device_data}"
-                    )
-                    return device_id, device_data
-                elif device_id in self.device_data:
-                    LOGGER.warning(f"Using cached data for device {device_id}")
-                    return device_id, self.device_data[device_id]
-                else:
-                    LOGGER.warning(f"No valid data for device {device_id}")
-                    return device_id, None
-            except Exception as e:
-                LOGGER.error(f"Error updating device {device_id}: {e}")
-                if device_id in self.device_data:
-                    return device_id, self.device_data[device_id]
+            device_data = await self.get_device_data(device_id)
+            if device_data and isinstance(device_data.get("attr"), dict):
+                LOGGER.debug(
+                    f"Got fresh data for device {device_id}: {device_data}"
+                )
+                return device_id, device_data
+            elif device_id in self.device_data:
+                LOGGER.warning(f"Using cached data for device {device_id}")
+                return device_id, self.device_data[device_id]
+            else:
+                LOGGER.warning(f"No valid data for device {device_id}")
                 return device_id, None
 
         # Create tasks for all devices
