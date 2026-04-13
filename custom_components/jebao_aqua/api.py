@@ -31,6 +31,7 @@ class GizwitsApi:
         device_data_url,
         control_url,
         token: str = None,
+        refresh_token_url: str = None,
     ):
         self._token = token
         self._attribute_models = None
@@ -38,6 +39,7 @@ class GizwitsApi:
         self.devices_url = devices_url
         self.device_data_url = device_data_url
         self.control_url = control_url
+        self.refresh_token_url = refresh_token_url
 
     async def async_init_session(self):
         """Initialize the aiohttp session. Must be called before making API requests."""
@@ -59,11 +61,15 @@ class GizwitsApi:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
-    async def async_login(self, email: str, password: str) -> Tuple[str, str]:
-        """Login to Gizwits and return the token and any error code.
+    async def async_login(self, email: str, password: str) -> dict:
+        """Login to Gizwits and return token info.
 
         Returns:
-            Tuple[str, str]: (token, error_code). If successful, error_code will be None.
+            dict with keys:
+                - "token": user token (str or None)
+                - "refresh_token": refresh token (str or None)
+                - "expires_at": token expiry epoch (int or None)
+                - "error": error code string (str or None)
         """
         data = {
             "appKey": GIZWITS_APP_ID,
@@ -96,8 +102,8 @@ class GizwitsApi:
                     if json_response.get("error", False):
                         error_code = json_response.get("code")
                         if error_code in GIZWITS_ERROR_CODES:
-                            return None, GIZWITS_ERROR_CODES[error_code]
-                        return None, "unknown_error"
+                            return {"token": None, "refresh_token": None, "expires_at": None, "error": GIZWITS_ERROR_CODES[error_code]}
+                        return {"token": None, "refresh_token": None, "expires_at": None, "error": "unknown_error"}
 
                     # If no error, process the token
                     if json_response and isinstance(json_response, dict):
@@ -106,8 +112,20 @@ class GizwitsApi:
 
                         if isinstance(data, dict):
                             token = data.get("userToken")
+                            refresh_token = data.get("refreshToken")
+                            expires_at = data.get("expiredAt")
                             if token:
-                                return token, None
+                                LOGGER.debug(
+                                    "Login successful, token expires at %s, refresh token present: %s",
+                                    expires_at,
+                                    refresh_token is not None,
+                                )
+                                return {
+                                    "token": token,
+                                    "refresh_token": refresh_token,
+                                    "expires_at": expires_at,
+                                    "error": None,
+                                }
                             else:
                                 LOGGER.error("No userToken in data: %s", data)
                         else:
@@ -117,7 +135,7 @@ class GizwitsApi:
                                 type(data),
                             )
 
-                    return None, "invalid_response"
+                    return {"token": None, "refresh_token": None, "expires_at": None, "error": "invalid_response"}
 
                 except json.JSONDecodeError as e:
                     LOGGER.error(
@@ -125,15 +143,59 @@ class GizwitsApi:
                         e,
                         response_text,
                     )
-                    return None, "invalid_json"
+                    return {"token": None, "refresh_token": None, "expires_at": None, "error": "invalid_json"}
 
         except Exception as e:
             LOGGER.error("Exception during login to Gizwits API: %s", e)
-            return None, "connection_error"
+            return {"token": None, "refresh_token": None, "expires_at": None, "error": "connection_error"}
 
     def set_token(self, token: str):
         """Set the user token for the API."""
         self._token = token
+
+    async def async_refresh_token(self, refresh_token: str) -> dict:
+        """Exchange a refresh token for a new user token.
+
+        Returns:
+            dict with keys:
+                - "token": new user token (str or None)
+                - "expires_at": new expiry epoch (int or None)
+                - "error": error string (str or None)
+        """
+        if not self.refresh_token_url:
+            return {"token": None, "expires_at": None, "error": "no_refresh_url"}
+
+        await self._ensure_session()
+        headers = {
+            "X-Gizwits-Application-Id": GIZWITS_APP_ID,
+            "X-Gizwits-User-token": self._token,
+            "Content-Type": "application/json",
+        }
+        try:
+            async with self._session.post(
+                self.refresh_token_url,
+                json={"refresh_token": refresh_token},
+                headers=headers,
+                timeout=TIMEOUT,
+            ) as response:
+                response_text = await response.text()
+                LOGGER.debug("Refresh token response status: %s", response.status)
+                LOGGER.debug("Refresh token response body: %s", response_text)
+
+                if response.status == 200:
+                    result = json.loads(response_text)
+                    new_token = result.get("token")
+                    expires_at = result.get("expire_at")
+                    if new_token:
+                        self._token = new_token
+                        LOGGER.info("Token refreshed successfully, new expiry: %s", expires_at)
+                        return {"token": new_token, "expires_at": expires_at, "error": None}
+
+                return {"token": None, "expires_at": None, "error": "refresh_failed"}
+
+        except Exception as e:
+            LOGGER.error("Exception during token refresh: %s", e)
+            return {"token": None, "expires_at": None, "error": "connection_error"}
 
     def add_attribute_models(self, attribute_models):
         """Add attribute models to the API instance."""
@@ -340,10 +402,13 @@ class GizwitsApi:
                 product_key,
             )
             return None
+
+        is_push_based = attribute_model.get("push_based", False)
         LOGGER.debug(
-            "Attempting to get local device data - IP: %s, Device ID: %s",
+            "Attempting to get local device data - IP: %s, Device ID: %s, push_based: %s",
             device_ip,
             device_id,
+            is_push_based,
         )
 
         try:
@@ -375,19 +440,33 @@ class GizwitsApi:
                     return None
                 LOGGER.debug("Binding ACK for %s: %s", device_id, frame.hex())
 
-                # Step 3: Request device status (cmd 0x0093 → response 0x0094)
-                await self._send_local_command(
-                    writer, b"\x00\x93", b"\x00\x00\x00\x02\x02"
-                )
-                response = await self._read_response_for_command(reader, 0x0094)
+                if is_push_based:
+                    # Push-based devices: send 0x0093 trigger, then wait for
+                    # unsolicited 0x0091 push frames instead of 0x0094 response.
+                    await self._send_local_command(
+                        writer, b"\x00\x93", b"\x00\x00\x00\x02\x02"
+                    )
+                    response = await self._wait_for_push_status(reader, device_id)
+                else:
+                    # Standard poll: cmd 0x0093 → response 0x0094
+                    await self._send_local_command(
+                        writer, b"\x00\x93", b"\x00\x00\x00\x02\x02"
+                    )
+                    response = await self._read_response_for_command(reader, 0x0094)
+
                 if response is None:
                     LOGGER.error(
-                        "No status response (0x0094) from %s", device_id
+                        "No status response from %s (push_based=%s)",
+                        device_id,
+                        is_push_based,
                     )
                     return None
 
                 LOGGER.debug(
-                    "Status response for %s: %s", device_id, response.hex()
+                    "Status response for %s (%d bytes): %s",
+                    device_id,
+                    len(response),
+                    response[:40].hex() + "...",
                 )
 
                 # Process the response
@@ -426,6 +505,135 @@ class GizwitsApi:
                 e,
             )
             return None
+
+    async def _wait_for_push_status(self, reader, device_id, timeout=15):
+        """Wait for a 0x0091 push status frame from a push-based device.
+
+        Push-based devices (e.g. Maxspect) send unsolicited 0x0091 frames
+        after the handshake + 0x0093 trigger. The first usable frame has a
+        large payload (>50 bytes); smaller frames are mode-block-only pushes
+        that we skip.
+        """
+        import time
+        deadline = time.monotonic() + timeout
+        LOGGER.debug("Waiting up to %ds for 0x0091 push from %s", timeout, device_id)
+
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                frame = await asyncio.wait_for(
+                    self._read_gizwits_frame(reader),
+                    timeout=min(remaining, LAN_COMMAND_TIMEOUT),
+                )
+            except asyncio.TimeoutError:
+                # Individual read timed out — keep waiting until deadline
+                continue
+
+            if frame is None:
+                # Stream returned None (e.g. internal timeout inside
+                # _read_gizwits_frame) — brief pause then retry
+                await asyncio.sleep(0.1)
+                continue
+
+            cmd = self._get_frame_command(frame)
+            LOGGER.debug(
+                "Push frame from %s: cmd=0x%04x, %d bytes",
+                device_id,
+                cmd if cmd else 0,
+                len(frame),
+            )
+
+            if cmd == 0x0091:
+                # Accept only full-size status frames (>50 byte payload)
+                payload = self._extract_device_status_payload(frame)
+                if payload and len(payload) > 50:
+                    LOGGER.debug(
+                        "Accepted 0x0091 push (%d byte payload) from %s",
+                        len(payload),
+                        device_id,
+                    )
+                    return frame
+                LOGGER.debug(
+                    "Skipping short 0x0091 push (%d byte payload) from %s",
+                    len(payload) if payload else 0,
+                    device_id,
+                )
+            elif cmd == 0x000D:
+                # Heartbeat response — ignore
+                pass
+            else:
+                LOGGER.debug(
+                    "Ignoring frame cmd 0x%04x while waiting for 0x0091",
+                    cmd if cmd else 0,
+                )
+
+        LOGGER.warning(
+            "No push status (0x0091) received from %s within %ds", device_id, timeout
+        )
+        return None
+
+    @staticmethod
+    async def validate_lan_device(device_ip):
+        """Validate a device is reachable on LAN and return its binding info.
+
+        Returns (True, binding_key_hex) on success, (False, error_msg) on failure.
+        Used by the config flow for manual device addition.
+        """
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(device_ip, LAN_PORT),
+                timeout=LAN_CONNECT_TIMEOUT,
+            )
+            try:
+                # Send device info request (0x0006)
+                header = b"\x00\x00\x00\x03"
+                flag = b"\x00"
+                command = b"\x00\x06"
+                length = len(flag + command).to_bytes(1, byteorder="big")
+                packet = header + length + flag + command
+                writer.write(packet)
+                await writer.drain()
+
+                # Read response — expect 0x0007
+                resp_header = await asyncio.wait_for(
+                    reader.readexactly(4), timeout=LAN_COMMAND_TIMEOUT
+                )
+                if resp_header != b"\x00\x00\x00\x03":
+                    return False, "invalid_response"
+
+                # Read LEB128 length
+                resp_length = 0
+                shift = 0
+                while True:
+                    byte_data = await asyncio.wait_for(
+                        reader.readexactly(1), timeout=LAN_COMMAND_TIMEOUT
+                    )
+                    byte_val = byte_data[0]
+                    resp_length |= (byte_val & 0x7F) << shift
+                    if (byte_val & 0x80) == 0:
+                        break
+                    shift += 7
+                    if shift > 35:
+                        return False, "invalid_response"
+
+                data = await asyncio.wait_for(
+                    reader.readexactly(resp_length), timeout=LAN_COMMAND_TIMEOUT
+                )
+                # Binding key is the last 12 bytes of the response data
+                binding_key = data[-12:]
+                return True, binding_key.hex()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        except asyncio.TimeoutError:
+            return False, "timeout"
+        except ConnectionError:
+            return False, "cannot_connect"
+        except Exception as e:
+            LOGGER.error("Error validating LAN device %s: %s", device_ip, e)
+            return False, "cannot_connect"
 
     async def _send_local_command(self, writer, command, payload=b""):
         """Send a command to the local device."""

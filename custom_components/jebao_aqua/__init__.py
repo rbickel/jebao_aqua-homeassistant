@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
@@ -10,7 +11,7 @@ from pathlib import Path
 from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
 from homeassistant.helpers.device_registry import async_get as async_get_device_registry
 
-from .const import DOMAIN, PLATFORMS, UPDATE_INTERVAL, LOGGER, GIZWITS_API_URLS, MAX_LAN_FAILURES
+from .const import DOMAIN, PLATFORMS, UPDATE_INTERVAL, LOGGER, GIZWITS_API_URLS, MAX_LAN_FAILURES, TOKEN_REFRESH_MARGIN
 from .api import GizwitsApi
 from .discovery import discover_devices
 from .helpers import is_device_data_valid  # Add this import
@@ -50,37 +51,61 @@ async def load_attribute_models(hass: HomeAssistant) -> dict:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up Jebao Pump from a config entry."""
+    lan_only = entry.data.get("lan_only", False)
     token = entry.data.get("token")
     region = entry.data.get("region")  # Get region from config entry
 
-    if not token or not region:
+    if not lan_only and (not token or not region):
         LOGGER.error("API token or region not found in configuration entry")
         return False
 
     # Load attribute models asynchronously
     attribute_models = await load_attribute_models(hass)
-    LOGGER.debug(f"Setting up API object with token: {token} and region: {region}")
 
-    # Initialize API with correct regional URLs
-    api = GizwitsApi(
-        login_url=GIZWITS_API_URLS[region]["LOGIN_URL"],
-        devices_url=GIZWITS_API_URLS[region]["DEVICES_URL"],
-        device_data_url=GIZWITS_API_URLS[region]["DEVICE_DATA_URL"],
-        control_url=GIZWITS_API_URLS[region]["CONTROL_URL"],
-        token=token,
-    )
+    if lan_only:
+        LOGGER.debug("Setting up LAN-only entry (no cloud credentials)")
+        api = GizwitsApi(
+            login_url="",
+            devices_url="",
+            device_data_url="",
+            control_url="",
+        )
+    else:
+        LOGGER.debug(f"Setting up API object with token: {token} and region: {region}")
+        api = GizwitsApi(
+            login_url=GIZWITS_API_URLS[region]["LOGIN_URL"],
+            devices_url=GIZWITS_API_URLS[region]["DEVICES_URL"],
+            device_data_url=GIZWITS_API_URLS[region]["DEVICE_DATA_URL"],
+            control_url=GIZWITS_API_URLS[region]["CONTROL_URL"],
+            token=token,
+            refresh_token_url=GIZWITS_API_URLS[region]["REFRESH_TOKEN_URL"],
+        )
 
     await api.async_init_session()
     api.add_attribute_models(attribute_models)
-    coordinator = GizwitsDataUpdateCoordinator(hass, api)
-    await coordinator.fetch_initial_device_list(entry)
+    coordinator = GizwitsDataUpdateCoordinator(hass, api, entry=entry, lan_only=lan_only)
+
+    if lan_only:
+        # Populate device inventory directly from config entry data
+        config_devices = entry.data.get("devices", [])
+        coordinator.device_inventory = config_devices
+        LOGGER.debug("LAN-only device inventory: %s", config_devices)
+    else:
+        await coordinator.fetch_initial_device_list(entry)
 
     try:
         await coordinator.async_config_entry_first_refresh()
     except Exception as err:
-        LOGGER.error("Error setting up entry: %s", err)
-        await api.close()
-        raise ConfigEntryNotReady from err
+        if lan_only:
+            # For LAN-only / push-based devices, first refresh may fail
+            # because the device hasn't pushed yet. Log warning and continue.
+            LOGGER.warning(
+                "First refresh failed for LAN-only entry (will retry): %s", err
+            )
+        else:
+            LOGGER.error("Error setting up entry: %s", err)
+            await api.close()
+            raise ConfigEntryNotReady from err
 
     hass.data[DOMAIN][entry.entry_id] = {
         "api": api,
@@ -89,7 +114,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     }
 
     # Auto-discover devices and update config entry if needed
-    if entry.data.get("auto_discover", True):  # Default to True if not specified
+    if not lan_only and entry.data.get("auto_discover", True):
         discovered_devices = await discover_devices()
         if discovered_devices:
             hass.data[DOMAIN][entry.entry_id]["discovered_devices"] = (
@@ -113,7 +138,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
 
 class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass, api):
+    def __init__(self, hass, api, entry: ConfigEntry = None, lan_only=False):
         """Initialize."""
         super().__init__(hass, LOGGER, name=DOMAIN, update_interval=UPDATE_INTERVAL)
         self.api = api
@@ -121,6 +146,8 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
         self.device_data = {}
         self._device_update_locks = {}  # Add locks per device
         self._lan_failure_counts = {}  # Track consecutive LAN failures per device
+        self._lan_only = lan_only
+        self._entry = entry
 
     async def fetch_initial_device_list(self, entry: ConfigEntry):
         """Fetch the initial list of devices and add LAN IPs."""
@@ -148,6 +175,58 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as e:
             LOGGER.error(f"Error fetching initial device list: {e}")
 
+    async def _maybe_refresh_token(self):
+        """Check if the cloud token is near expiry and refresh it."""
+        if self._lan_only or not self._entry:
+            return
+
+        expires_at = self._entry.data.get("token_expires_at")
+        if not expires_at:
+            return
+
+        remaining = expires_at - time.time()
+        if remaining > TOKEN_REFRESH_MARGIN:
+            return  # Token still has plenty of time
+
+        LOGGER.info(
+            "Cloud token expires in %.1f days, attempting refresh",
+            remaining / 86400,
+        )
+
+        # First, try the refresh token (single-use, no new refresh token returned)
+        refresh_token = self._entry.data.get("refresh_token")
+        if refresh_token:
+            result = await self.api.async_refresh_token(refresh_token)
+            if result["token"]:
+                new_data = {**self._entry.data}
+                new_data["token"] = result["token"]
+                new_data["token_expires_at"] = result["expires_at"]
+                new_data["refresh_token"] = None  # Consumed
+                self.hass.config_entries.async_update_entry(
+                    self._entry, data=new_data
+                )
+                LOGGER.info("Token refreshed via refresh_token, new expiry: %s", result["expires_at"])
+                return
+
+        # Refresh token unavailable or failed — re-login with stored credentials
+        email = self._entry.data.get("email")
+        password = self._entry.data.get("password")
+        if email and password:
+            LOGGER.info("Refresh token exhausted, re-authenticating with stored credentials")
+            login_result = await self.api.async_login(email, password)
+            if login_result["token"]:
+                new_data = {**self._entry.data}
+                new_data["token"] = login_result["token"]
+                new_data["refresh_token"] = login_result["refresh_token"]
+                new_data["token_expires_at"] = login_result["expires_at"]
+                self.hass.config_entries.async_update_entry(
+                    self._entry, data=new_data
+                )
+                LOGGER.info("Re-authenticated successfully, new token expires at %s", login_result["expires_at"])
+                return
+
+        LOGGER.warning("Unable to refresh token — no refresh token or stored credentials available")
+
     async def get_device_data(self, device_id):
         """Get device data locally with cloud fallback, with lock protection."""
         # Get or create lock for this device
@@ -169,7 +248,7 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
             lan_failures = self._lan_failure_counts.get(device_id, 0)
 
             # Try LAN first if IP is available and not in backoff
-            if device_info and lan_ip and lan_failures < MAX_LAN_FAILURES:
+            if device_info and lan_ip and (self._lan_only or lan_failures < MAX_LAN_FAILURES):
                 LOGGER.debug(
                     f"Getting local data for device {device_id} at {lan_ip}"
                 )
@@ -188,7 +267,7 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                         self._lan_failure_counts[device_id],
                         MAX_LAN_FAILURES,
                     )
-            elif lan_ip and lan_failures >= MAX_LAN_FAILURES:
+            elif lan_ip and not self._lan_only and lan_failures >= MAX_LAN_FAILURES:
                 LOGGER.debug(
                     "LAN disabled for %s after %d failures, using cloud. "
                     "Will retry LAN after a successful cloud poll.",
@@ -196,8 +275,8 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                     lan_failures,
                 )
 
-            # Cloud fallback (or primary if no LAN IP)
-            if data is None:
+            # Cloud fallback (or primary if no LAN IP) — skip for LAN-only
+            if data is None and not self._lan_only:
                 LOGGER.debug(f"Getting cloud data for device {device_id}")
                 data = await self.api.get_device_data(device_id)
                 if data and lan_failures >= MAX_LAN_FAILURES:
@@ -215,6 +294,7 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self):
         """Fetch the latest status for each device."""
+        await self._maybe_refresh_token()
         new_data = {}
 
         async def update_single_device(device_id: str):

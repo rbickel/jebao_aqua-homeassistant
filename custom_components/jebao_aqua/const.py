@@ -16,18 +16,21 @@ GIZWITS_API_URLS = {
         "DEVICES_URL": "https://euapi.gizwits.com/app/bindings",
         "DEVICE_DATA_URL": "https://euapi.gizwits.com/app/devdata/{device_id}/latest",
         "CONTROL_URL": "https://euapi.gizwits.com/app/control/{device_id}",
+        "REFRESH_TOKEN_URL": "https://euapi.gizwits.com/app/refresh_token",
     },
     "us": {
         "LOGIN_URL": "https://usaepapp.gizwits.com/app/smart_home/login/pwd",
         "DEVICES_URL": "https://usapi.gizwits.com/app/bindings",
         "DEVICE_DATA_URL": "https://usapi.gizwits.com/app/devdata/{device_id}/latest",
         "CONTROL_URL": "https://usapi.gizwits.com/app/control/{device_id}",
+        "REFRESH_TOKEN_URL": "https://usapi.gizwits.com/app/refresh_token",
     },
     "cn": {
         "LOGIN_URL": "https://aep-app.gizwits.com/app/smart_home/login/pwd",
         "DEVICES_URL": "https://api.gizwits.com/app/bindings",
         "DEVICE_DATA_URL": "https://api.gizwits.com/app/devdata/{device_id}/latest",
         "CONTROL_URL": "https://api.gizwits.com/app/control/{device_id}",
+        "REFRESH_TOKEN_URL": "https://api.gizwits.com/app/refresh_token",
     },
 }
 
@@ -45,6 +48,9 @@ UPDATE_INTERVAL = timedelta(seconds=2)
 
 # Maximum consecutive LAN failures before falling back to cloud
 MAX_LAN_FAILURES = 3
+
+# Refresh the cloud token when less than this many seconds remain
+TOKEN_REFRESH_MARGIN = 7 * 24 * 3600  # 7 days
 
 # Platform types
 PLATFORMS = ["switch", "sensor", "select", "number"]

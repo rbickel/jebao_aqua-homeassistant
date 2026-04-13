@@ -3,12 +3,29 @@
     "title": "Pompe per acquario Jebao",
     "step": {
       "user": {
+        "title": "Metodo di configurazione",
+        "description": "Scegli come aggiungere il tuo dispositivo.",
+        "menu_options": {
+          "cloud_login": "Accesso cloud (account Jebao)",
+          "manual_device": "Aggiungi dispositivo tramite IP"
+        }
+      },
+      "cloud_login": {
         "title": "Accedi a Jebao",
         "description": "Inserisci le tue credenziali Jebao e seleziona il tuo paese.",
         "data": {
           "email": "Email",
           "password": "Password",
           "country": "Paese"
+        }
+      },
+      "manual_device": {
+        "title": "Aggiungi dispositivo tramite IP",
+        "description": "Inserisci l'indirizzo IP e seleziona il tipo di dispositivo.",
+        "data": {
+          "ip_address": "Indirizzo IP",
+          "device_type": "Tipo di dispositivo",
+          "device_name": "Nome dispositivo (opzionale)"
         }
       },
       "device_setup": {

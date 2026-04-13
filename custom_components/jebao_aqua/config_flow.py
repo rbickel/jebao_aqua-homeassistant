@@ -1,9 +1,11 @@
 import logging
+import json
 import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
 from homeassistant import config_entries
 from homeassistant.core import callback
 from functools import lru_cache
+from pathlib import Path
 import pycountry
 import asyncio
 import ipaddress
@@ -52,9 +54,32 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         }  # Add email to config
         # Pre-load country choices during initialization
         self._country_choices = None
+        self._model_choices = None
+
+    def _load_model_choices(self):
+        """Load device model choices from model JSON files."""
+        models_path = Path(__file__).parent / "models"
+        choices = {}
+        for model_file in models_path.glob("*.json"):
+            try:
+                with open(model_file, "r") as f:
+                    model = json.load(f)
+                product_key = model.get("product_key", model_file.stem)
+                name = model.get("name", product_key)
+                choices[product_key] = name
+            except Exception:
+                pass
+        return choices
 
     async def async_step_user(self, user_input=None):
-        """Handle user step."""
+        """Show menu to choose between cloud login and manual device."""
+        return self.async_show_menu(
+            step_id="user",
+            menu_options=["cloud_login", "manual_device"],
+        )
+
+    async def async_step_cloud_login(self, user_input=None):
+        """Handle cloud login step."""
         errors = {}
 
         # Load country choices in executor if not already loaded
@@ -78,13 +103,18 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
 
             async with self._api as api:
-                token, error_code = await api.async_login(
+                login_result = await api.async_login(
                     user_input["email"], user_input["password"]
                 )
+                token = login_result["token"]
+                error_code = login_result["error"]
 
                 if token:
                     api.set_token(token)
-                    self._config["token"] = token  # Store token in config
+                    self._config["token"] = token
+                    self._config["refresh_token"] = login_result["refresh_token"]
+                    self._config["token_expires_at"] = login_result["expires_at"]
+                    self._config["password"] = user_input["password"]
                     self._devices = await api.get_devices()
 
                     if self._devices and "devices" in self._devices:
@@ -150,8 +180,65 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
         return self.async_show_form(
-            step_id="user",
+            step_id="cloud_login",
             data_schema=country_schema,
+            errors=errors,
+        )
+
+    async def async_step_manual_device(self, user_input=None):
+        """Handle manual device addition by IP address."""
+        errors = {}
+
+        # Load model choices if not cached
+        if self._model_choices is None:
+            self._model_choices = await self.hass.async_add_executor_job(
+                self._load_model_choices
+            )
+
+        if user_input is not None:
+            ip_address_str = user_input["ip_address"].strip()
+            device_type = user_input["device_type"]
+            device_name = user_input.get("device_name", "").strip()
+
+            # Validate IP address
+            try:
+                ipaddress.ip_address(ip_address_str)
+            except ValueError:
+                errors["ip_address"] = "invalid_ip"
+
+            if not errors:
+                # Validate the device is reachable
+                success, result = await GizwitsApi.validate_lan_device(ip_address_str)
+                if success:
+                    binding_key_hex = result
+                    device_entry = {
+                        "did": f"lan_{ip_address_str.replace('.', '_')}",
+                        "product_key": device_type,
+                        "dev_alias": device_name or self._model_choices.get(device_type, device_type),
+                        "lan_ip": ip_address_str,
+                        "binding_key": binding_key_hex,
+                    }
+                    return self.async_create_entry(
+                        title=device_name or self._model_choices.get(device_type, "Gizwits Device"),
+                        data={
+                            "lan_only": True,
+                            "devices": [device_entry],
+                        },
+                    )
+                else:
+                    errors["base"] = result  # "timeout" or "cannot_connect"
+
+        schema = vol.Schema(
+            {
+                vol.Required("ip_address"): str,
+                vol.Required("device_type"): vol.In(self._model_choices),
+                vol.Optional("device_name", default=""): str,
+            }
+        )
+
+        return self.async_show_form(
+            step_id="manual_device",
+            data_schema=schema,
             errors=errors,
         )
 
@@ -284,11 +371,16 @@ class JebaoPumpOptionsFlowHandler(config_entries.OptionsFlow):
             )
 
             async with self._api as api:
-                token, error_code = await api.async_login(  # Change this line
+                login_result = await api.async_login(
                     user_input["email"], user_input["password"]
                 )
-                if token:  # Just check for token
+                token = login_result["token"]
+                error_code = login_result["error"]
+                if token:
                     self._config["token"] = token
+                    self._config["refresh_token"] = login_result["refresh_token"]
+                    self._config["token_expires_at"] = login_result["expires_at"]
+                    self._config["password"] = user_input["password"]
                     api.set_token(token)
                     self._devices = await api.get_devices()
 
@@ -384,7 +476,10 @@ class JebaoPumpOptionsFlowHandler(config_entries.OptionsFlow):
                     # Create new config data first
                     new_data = {
                         "email": self._config["email"],
+                        "password": self._config["password"],
                         "token": self._config["token"],
+                        "refresh_token": self._config.get("refresh_token"),
+                        "token_expires_at": self._config.get("token_expires_at"),
                         "region": self._config["region"],
                         "country": self._config["country"],
                         "devices": new_devices,

@@ -3,12 +3,29 @@
     "title": "Jebao Aquariumpumpen",
     "step": {
       "user": {
+        "title": "Einrichtungsmethode",
+        "description": "Wählen Sie, wie Sie Ihr Gerät hinzufügen möchten.",
+        "menu_options": {
+          "cloud_login": "Cloud-Anmeldung (Jebao-Konto)",
+          "manual_device": "Gerät per IP-Adresse hinzufügen"
+        }
+      },
+      "cloud_login": {
         "title": "Bei Jebao anmelden",
         "description": "Bitte geben Sie Ihre Jebao-Anmeldedaten ein und wählen Sie Ihr Land aus.",
         "data": {
           "email": "E-Mail",
           "password": "Passwort",
           "country": "Land"
+        }
+      },
+      "manual_device": {
+        "title": "Gerät per IP hinzufügen",
+        "description": "Geben Sie die IP-Adresse ein und wählen Sie den Gerätetyp.",
+        "data": {
+          "ip_address": "IP-Adresse",
+          "device_type": "Gerätetyp",
+          "device_name": "Gerätename (optional)"
         }
       },
       "device_setup": {
