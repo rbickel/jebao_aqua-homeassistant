@@ -312,3 +312,32 @@ class TestConfigEntryMigration:
         assert "password" in entry.data
         assert entry.data.get("password") is None
 
+    @pytest.mark.asyncio
+    async def test_setup_warns_when_password_is_none(
+        self, hass: HomeAssistant, mock_api, mock_attribute_models, caplog
+    ):
+        """Setup should log warning when password is None after migration."""
+        import logging
+
+        # Create a v2 config entry with password=None (simulating migrated entry)
+        data = make_config_entry_data()
+        data["password"] = None
+        entry = MockConfigEntry(domain=DOMAIN, data=data, version=2)
+        entry.add_to_hass(hass)
+
+        # Trigger setup with logging
+        p1, p2, p3 = _patch_setup(mock_api, mock_attribute_models)
+        with p1, p2, p3:
+            with caplog.at_level(logging.WARNING):
+                await hass.config_entries.async_setup(entry.entry_id)
+                await hass.async_block_till_done()
+
+        # Should have logged the warning about missing password
+        assert any(
+            "Password not stored in config entry" in record.message
+            for record in caplog.records
+        )
+        # But entry should still be loaded
+        assert entry.state == ConfigEntryState.LOADED
+
+
