@@ -37,7 +37,7 @@ def get_country_choices():
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self):
         self._api = None  # Initialize _api to None
