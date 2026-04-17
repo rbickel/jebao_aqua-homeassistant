@@ -316,7 +316,7 @@ class TestConfigEntryMigration:
     async def test_setup_warns_when_password_is_none(
         self, hass: HomeAssistant, mock_api, mock_attribute_models, caplog
     ):
-        """Setup should log warning when password is None after migration."""
+        """Setup should log warning and trigger reauth when password is None after migration."""
         import logging
 
         # Create a v2 config entry with password=None (simulating migrated entry)
@@ -337,7 +337,15 @@ class TestConfigEntryMigration:
             "Password not stored in config entry" in record.message
             for record in caplog.records
         )
-        # But entry should still be loaded
+        # Entry should still be loaded
         assert entry.state == ConfigEntryState.LOADED
+        # A reauth flow should have been started
+        reauth_flows = [
+            flow
+            for flow in hass.config_entries.flow.async_progress()
+            if flow["context"].get("source") == "reauth"
+            and flow["context"].get("entry_id") == entry.entry_id
+        ]
+        assert len(reauth_flows) == 1
 
 

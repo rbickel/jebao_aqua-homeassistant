@@ -89,6 +89,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             "Automatic token refresh will not be available. "
             "Please reconfigure the integration to enable this feature."
         )
+        entry.async_start_reauth(hass)
 
     # Load attribute models asynchronously
     attribute_models = await load_attribute_models(hass)
