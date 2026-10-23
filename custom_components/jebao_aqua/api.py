@@ -15,6 +15,15 @@ from .const import (
     GIZWITS_API_URLS,
     DEFAULT_REGION,
 )
+from .local import (
+    PROFILES as LOCAL_PROFILES,
+    ProbeError as LocalControlError,
+    Status as LocalStatus,
+    control_device as control_local,
+    decode_status,
+    read_device as read_local,
+    ping_device as ping_local,
+)
 
 GIZWITS_ERROR_CODES = {
     "1000000": "user_not_exist",
@@ -286,6 +295,41 @@ class GizwitsApi:
         )
         return await self._api_request("POST", url, json=data)
 
+    async def control_local_device(
+        self, device_ip: str, product_key: str, device_id: str, attributes: dict,
+    ) -> dict:
+        """Set verified pump attributes and confirm them by fresh LAN read-back."""
+        model = self._attribute_models.get(product_key) if self._attribute_models else None
+        if product_key not in LOCAL_PROFILES or not model:
+            raise LocalControlError("No verified local control model for this device")
+        # Reuse the hardware-tested socket client without blocking HA's event loop.
+        status = await self._async_local_request(
+            control_local, device_ip, device_id, attributes, model,
+        )
+        return {"did": status.device_id, "attr": decode_status(status, model)}
+
+    async def ping_device(self, device_ip: str, device_id: str) -> bool:
+        """Check controller reachability without trusting cached state or an open port."""
+        try:
+            return await asyncio.to_thread(ping_local, device_ip, device_id)
+        except (OSError, LocalControlError) as error:
+            LOGGER.debug("Local identity ping failed for %s: %s", device_id, error)
+            return False
+
+    async def _async_local_request(
+        self, function: Callable[..., LocalStatus], *args: object,
+    ) -> LocalStatus:
+        task = asyncio.create_task(asyncio.to_thread(function, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Socket threads cannot be cancelled; retain the device lock until I/O ends.
+            try:
+                await task
+            except (OSError, LocalControlError) as error:
+                LOGGER.warning("Local request ended during cancellation: %s", error)
+            raise
+
     async def _read_gizwits_frame(self, reader):
         """Read a complete Gizwits LAN protocol frame from the stream.
 
@@ -392,6 +436,13 @@ class GizwitsApi:
                 product_key,
             )
             return None
+        if product_key in LOCAL_PROFILES:
+            try:
+                status = await self._async_local_request(read_local, device_ip, device_id)
+                return {"did": status.device_id, "attr": decode_status(status, attribute_model)}
+            except (OSError, LocalControlError) as error:
+                LOGGER.warning("Local status failed for %s: %s", device_id, error)
+                return None
         LOGGER.debug(
             "Attempting to get local device data - IP: %s, Device ID: %s",
             device_ip,

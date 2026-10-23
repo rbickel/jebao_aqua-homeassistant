@@ -6,7 +6,6 @@ from .helpers import (
     create_entity_name,
     create_entity_id,
     create_unique_id,
-    is_device_data_valid,
     get_attribute_value,
 )
 import asyncio
@@ -30,8 +29,7 @@ class JebaoPumpSwitch(CoordinatorEntity, SwitchEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        device_data = self.coordinator.device_data.get(self._device["did"])
-        return is_device_data_valid(device_data)
+        return self.coordinator.is_device_available(self._device["did"])
 
     @property
     def is_on(self) -> bool:
@@ -41,7 +39,7 @@ class JebaoPumpSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs):
         """Turn the switch on."""
-        await self.coordinator.api.control_device(
+        await self.coordinator.async_control_device(
             self._device["did"], {self._attribute["name"]: True}
         )
         await asyncio.sleep(3)  # Wait for 3 seconds
@@ -49,7 +47,7 @@ class JebaoPumpSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs):
         """Turn the switch off."""
-        await self.coordinator.api.control_device(
+        await self.coordinator.async_control_device(
             self._device["did"], {self._attribute["name"]: False}
         )
         await asyncio.sleep(3)  # Wait for 3 seconds

@@ -2,6 +2,7 @@ import asyncio
 import socket
 import logging
 from .const import DISCOVERY_TIMEOUT
+from .local import ProbeError, decode_discovery_response
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -19,18 +20,13 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        if len(data) >= 32:
-            device_id_start = 10
-            device_id_length = 22
-            device_id = (
-                data[device_id_start : device_id_start + device_id_length]
-                .decode(errors="ignore")
-                .strip()
-            )
-
-            if device_id:
-                self.results[device_id] = addr[0]
-                _LOGGER.debug(f"Found device {device_id} at {addr[0]}")
+        try:
+            device_id = decode_discovery_response(data)
+        except ProbeError as error:
+            _LOGGER.debug("Ignoring invalid discovery response from %s: %s", addr[0], error)
+            return
+        self.results[device_id] = addr[0]
+        _LOGGER.debug(f"Found device {device_id} at {addr[0]}")
 
 
 async def discover_devices():

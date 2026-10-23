@@ -6,7 +6,6 @@ from .helpers import (
     create_entity_name,
     create_entity_id,
     create_unique_id,
-    is_device_data_valid,  # Add this import
     get_attribute_value,  # Add this import
 )
 
@@ -38,8 +37,7 @@ class JebaoPumpNumber(CoordinatorEntity, NumberEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        device_data = self.coordinator.device_data.get(self._device["did"])
-        return is_device_data_valid(device_data)
+        return self.coordinator.is_device_available(self._device["did"])
 
     @property
     def native_value(self):
@@ -50,7 +48,7 @@ class JebaoPumpNumber(CoordinatorEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float):
         """Set new value."""
-        await self.coordinator.api.control_device(
+        await self.coordinator.async_control_device(
             self._device["did"], {self._attribute["name"]: value}
         )
         await self.coordinator.async_request_refresh()
