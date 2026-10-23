@@ -1,4 +1,4 @@
-"""Standalone MCP150 LAN probe; writes require an explicit test option."""
+"""Standalone MCP150/MDP10000 LAN probe; writes require an explicit test option."""
 
 import argparse
 import importlib.util
@@ -85,22 +85,28 @@ def run_flow_test(host: str, hold: float) -> None:
 
 
 def verify_schedules(before: Status, after: Status) -> None:
-    if before.device_id != after.device_id:
+    if before.device_id != after.device_id or before.profile != after.profile:
         raise ProbeError("Device ID changed")
-    if before.raw[8:392] != after.raw[8:392]:
+    start, end = before.profile.schedule_range
+    if before.raw[start:end] != after.raw[start:end]:
         raise ProbeError("Native schedule data changed; check the pump/app")
-    if before.raw[400] != after.raw[400]:
-        raise ProbeError(f"Fault status changed from {before.raw[400]} to {after.raw[400]}")
+    fault = before.profile.writable_size
+    if before.raw[fault] != after.raw[fault]:
+        raise ProbeError(f"Fault status changed from {before.raw[fault]} to {after.raw[fault]}")
 
 
-def command_cases(status: Status) -> list[dict[str, protocol.ControlValue]]:
-    current = protocol.control_values(status, MODEL)
-    specs = {attr["name"]: attr for attr in MODEL["attrs"]}
+def command_cases(status: Status, model: dict = MODEL) -> list[dict[str, protocol.ControlValue]]:
+    current = protocol.control_values(status, model)
+    specs = {attr["name"]: attr for attr in model["attrs"]}
+    if current.keys() != status.profile.control_names:
+        raise ProbeError("Model does not define all controls in the verified profile")
     cases = []
     for name in (
-        "Flow", "Frequency", "FeedTime", "PulseTide", "Mode",
+        "Flow", "Motor_Speed", "Frequency", "FeedTime", "PulseTide", "Mode",
         "TimerON", "FeedSwitch", "SwitchON", "Linkage",
     ):
+        if name not in status.profile.control_names:
+            continue
         value = current[name]
         attr = specs[name]
         if attr["data_type"] == "enum":
@@ -116,22 +122,24 @@ def command_cases(status: Status) -> list[dict[str, protocol.ControlValue]]:
     return cases
 
 
-def run_attribute_test(host: str, changes: dict[str, protocol.ControlValue], hold: float) -> None:
+def run_attribute_test(
+    host: str, changes: dict[str, protocol.ControlValue], hold: float, model: dict = MODEL,
+) -> None:
     baseline = None
     write_attempted = False
     try:
         with connect(host) as client:
             baseline = client.read_status()
-            original = protocol.control_values(baseline, MODEL)
+            original = protocol.control_values(baseline, model)
             print(f"TEST {json.dumps(changes, ensure_ascii=False)}", flush=True)
             write_attempted = True
-            client.write_attributes(baseline, changes, MODEL)
-            observed = client.wait_for_attributes(changes, baseline.device_id, MODEL)
+            client.write_attributes(baseline, changes, model)
+            observed = client.wait_for_attributes(changes, baseline.device_id, model)
             verify_schedules(baseline, observed)
             time.sleep(hold)
-            observed = confirm_device(host, baseline.device_id, changes, MODEL)
+            observed = confirm_device(host, baseline.device_id, changes, model)
             verify_schedules(baseline, observed)
-            current = protocol.control_values(observed, MODEL)
+            current = protocol.control_values(observed, model)
             side_effects = {
                 name: current[name] for name, value in original.items()
                 if name not in changes and current[name] != value
@@ -141,22 +149,22 @@ def run_attribute_test(host: str, changes: dict[str, protocol.ControlValue], hol
             print("Independent LAN read confirmed requested values; schedules/faults unchanged", flush=True)
     finally:
         if write_attempted and baseline is not None:
-            original = protocol.control_values(baseline, MODEL)
+            original = protocol.control_values(baseline, model)
             try:
                 with connect(host) as client:
                     current = client.read_status()
                     if current.device_id != baseline.device_id:
                         raise ProbeError("Device ID changed; refusing restoration to another pump")
-                    current_values = protocol.control_values(current, MODEL)
+                    current_values = protocol.control_values(current, model)
                     restore = {
                         name: value for name, value in original.items()
                         if name in changes or current_values[name] != value
                     }
-                    client.write_attributes(current, restore, MODEL)
-                    client.wait_for_attributes(original, baseline.device_id, MODEL)
-                restored = confirm_device(host, baseline.device_id, original, MODEL)
+                    client.write_attributes(current, restore, model)
+                    client.wait_for_attributes(original, baseline.device_id, model)
+                restored = confirm_device(host, baseline.device_id, original, model)
                 verify_schedules(baseline, restored)
-                print("RESTORED: all nine controls verified on a fresh connection", flush=True)
+                print("RESTORED: all exposed controls verified on a fresh connection", flush=True)
             except (OSError, ProbeError) as error:
                 raise RestorationError(
                     f"Restoration failed on {host}. Check the app immediately. "
@@ -165,40 +173,47 @@ def run_attribute_test(host: str, changes: dict[str, protocol.ControlValue], hol
     print("PASS", flush=True)
 
 
-def run_all_tests(host: str, hold: float) -> None:
+def run_all_tests(host: str, hold: float, model: dict | None = None) -> None:
     with connect(host) as client:
         original = client.read_status()
-    original_values = protocol.control_values(original, MODEL)
+    if model is None:
+        model = json.loads((COMPONENT / "models" / f"{original.profile.product_key}.json").read_text())
+    original_values = protocol.control_values(original, model)
+    if original.summary()["TimerON"] and "TimerON" not in original_values:
+        raise ProbeError("Disable the native timer in the Jebao app before testing this model")
     try:
-        if original_values["TimerON"]:
-            protocol.control_device(host, original.device_id, {"TimerON": False}, MODEL)
+        if original_values.get("TimerON", False):
+            protocol.control_device(host, original.device_id, {"TimerON": False}, model)
             print("Native timer temporarily disabled to prevent manual settings being overridden", flush=True)
         with connect(host) as client:
             baseline = client.read_status()
-        cases = command_cases(baseline)
+        cases = command_cases(baseline, model)
         for changes in cases:
-            run_attribute_test(host, changes, hold)
+            run_attribute_test(host, changes, hold, model)
     finally:
         try:
-            final = protocol.control_device(host, original.device_id, original_values, MODEL)
+            final = protocol.control_device(host, original.device_id, original_values, model)
             verify_schedules(original, final)
-            print("FINAL RESTORED: original controls, including native timer, independently verified", flush=True)
+            print("FINAL RESTORED: original settings independently verified", flush=True)
         except (OSError, ProbeError) as error:
             raise RestorationError(
                 f"Final restoration failed. Original settings: "
                 f"{json.dumps(original_values, ensure_ascii=False)}. {error}"
             ) from error
-    print(f"ALL NINE CONTROLS PASSED ({len(cases)} changes plus restoration after each)", flush=True)
+    print(
+        f"ALL {len(original.profile.control_names)} CONTROLS PASSED "
+        f"({len(cases)} changes plus restoration after each)", flush=True,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("host", type=IPv4Address, help="MCP150 LAN IPv4 address")
+    parser.add_argument("host", type=IPv4Address, help="Pump LAN IPv4 address")
     tests = parser.add_mutually_exclusive_group()
     tests.add_argument("--test-flow", action="store_true", help="Reversible one-point Flow test")
     tests.add_argument(
         "--test-all", action="store_true",
-        help="Test all nine HA controls, including power, feeding/timer and every enum option",
+        help="Test all exposed controls for the detected pump, including power and feeding",
     )
     parser.add_argument(
         "--hold", type=float, default=2.0, metavar="SECONDS",
@@ -217,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             with connect(host) as client:
                 status = client.read_status()
                 print(json.dumps({
-                    "product_key": PRODUCT_KEY,
+                    "product_key": status.profile.product_key,
                     "wifi_firmware": client.wifi_firmware,
                     "device_id": status.device_id,
                     "state": status.summary(),

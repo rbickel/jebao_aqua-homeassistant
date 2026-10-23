@@ -2,7 +2,7 @@
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 
-Home Assistant custom integration for [Jebao](https://www.jebao-aqua.com/) Wi-Fi enabled aquarium wavemakers, pumps, and dosing pumps — with local LAN polling, verified MCP150 local control, and Gizwits cloud fallback.
+Home Assistant custom integration for [Jebao](https://www.jebao-aqua.com/) Wi-Fi enabled aquarium wavemakers, pumps, and dosing pumps — with local LAN polling, verified MCP150/MDP10000 local control, and Gizwits cloud fallback.
 
 ## How It Works
 
@@ -12,9 +12,10 @@ Jebao Wi-Fi devices use the **Gizwits IoT platform** under the hood.
 |---|---|
 | Device discovery | Bound to your Jebao Aqua / Gizwits account via cloud API |
 | State polling | Local LAN (TCP port 12416), with cloud fallback on failure |
-| Commands (on/off, mode, flow) | Verified MCP150: local LAN first, then cloud fallback; other models: cloud |
+| Commands (on/off, mode, flow) | Verified MCP150/MDP10000: local LAN first, then cloud fallback; other models: cloud |
+| Availability | Live device-identity ping; fresh cloud online status when LAN is unreachable |
 
-**Cloud credentials are still required** for setup/startup device discovery and cloud fallback. Once set up, supported MCP150 commands and normal status updates use the LAN.
+**Cloud credentials are still required** for setup/startup device discovery and cloud fallback. Once set up, supported pump commands and normal status updates use the LAN.
 
 ## Supported Devices
 
@@ -25,6 +26,7 @@ Jebao Wi-Fi devices use the **Gizwits IoT platform** under the hood.
 |---|---|---|
 | ✅ Confirmed | Jebao MCP Series Crossflow Wavemaker | Pump |
 | ✅ Confirmed | MCP150 ESP32-C3 (`54114ccdac1e41c0bb17e222887c07ba`), including local commands | Pump |
+| ✅ Confirmed | MDP10000 ESP8266 (`02039876751049deb404d1d89221ec4b`), including local commands | Return pump |
 | ✅ Confirmed | Jebao MLW Series Wavemaker | Pump |
 | ✅ Confirmed | Jebao Smart Doser 3.1 | Dosing pump |
 | ✅ Confirmed | Jebao MD 4.4 Dosing Pump | Dosing pump |
@@ -38,7 +40,8 @@ Jebao Wi-Fi devices use the **Gizwits IoT platform** under the hood.
 ## Features
 
 - **Local LAN polling** — device state is read directly over your network every 2 s; no cloud polling during normal operation
-- **Local-first MCP150 control** — verified commands use LAN, with automatic Gizwits cloud fallback; other models retain cloud control
+- **Local-first MCP150/MDP10000 control** — verified commands use LAN, with automatic Gizwits cloud fallback; other models retain cloud control
+- **Live availability** — cached state alone cannot keep a disconnected device marked available
 - **Multi-region support** — EU, US, and CN Gizwits endpoints automatically selected by country
 - **Pump control** — switch entities for power and other boolean states
 - **Flow & frequency** — numeric slider entities for fine-grained speed control
@@ -74,6 +77,40 @@ Devices without a LAN IP and other product keys continue using cloud commands.
 This does not provide fully offline startup or add local dosing/schedule writes.
 See [the development guide](DEV.md#standalone-mcp150-lan-control-experiment)
 for the reversible hardware probe.
+
+### MDP10000 local commands
+
+The MDP10000 product key `02039876751049deb404d1d89221ec4b` was verified with
+ESP8266 Wi-Fi firmware `04020B28`. All four existing HA controls support local
+commands with cloud fallback: power, feeding, motor speed, and feed duration.
+Each was tested with reversible changes and independent confirmation.
+
+Its legacy status frames omit the device ID, so a validated UDP identity reply
+binds each session to the correct controller before any write. Allow **TCP
+12416 and UDP 12414** between HA and the device. Unverified product keys and
+unexposed native schedule settings are not enabled for local writes.
+
+### Availability
+
+Each configured device is checked every **15 seconds** with a read-only Gizwits
+UDP request, validating the source address, protocol response and device ID.
+This is an application-level identity ping, not an ICMP echo or a port-open check.
+
+If LAN does not answer, one fresh cloud device-inventory request checks
+`is_online` for the affected devices. A local reply **or** a fresh cloud online
+indication counts as available. Two failed checks mark its entities unavailable,
+typically within 30–40 seconds depending on network timeouts.
+
+Last-known values are retained for recovery but are **not** liveness proof.
+Cached `/latest` cloud attributes and old inventory flags cannot refresh
+availability; health evidence also expires after 45 seconds. Successful direct
+LAN reads/commands and subsequent identity pings restore availability. A local
+ping also clears LAN backoff so status polling can recover without cloud access.
+Health checks run independently of slow polling and are stopped on unload.
+
+This measures **controller reachability**, not water flow or motor health.
+A powered-off motor can still have an available Wi-Fi controller; use the
+device-reported fault entities to monitor motor problems.
 
 ## Installation
 

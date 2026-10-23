@@ -6,7 +6,6 @@ from .helpers import (
     create_entity_name,
     create_entity_id,
     create_unique_id,
-    is_device_data_valid,
     get_attribute_value,
 )
 
@@ -33,8 +32,7 @@ class JebaoPumpSelect(CoordinatorEntity, SelectEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        device_data = self.coordinator.device_data.get(self._device["did"])
-        return is_device_data_valid(device_data)
+        return self.coordinator.is_device_available(self._device["did"])
 
     @property
     def current_option(self):

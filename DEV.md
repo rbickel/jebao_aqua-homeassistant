@@ -123,10 +123,11 @@ async def get_device_data(self, device_id):
 
 ### Standalone MCP150 LAN control experiment
 
-The standard-library-only [MCP150 probe](scripts/mcp150_local.py) loads the
+The standard-library-only [pump probe](scripts/mcp150_local.py) loads the
 integration's shared [LAN client](custom_components/jebao_aqua/local.py)
-without importing Home Assistant. It accepts only product key
-`54114ccdac1e41c0bb17e222887c07ba`; other devices are rejected before login.
+without importing Home Assistant. It auto-detects verified MCP150
+(`54114ccdac1e41c0bb17e222887c07ba`) and MDP10000
+(`02039876751049deb404d1d89221ec4b`) profiles; other products are rejected before login.
 It does not use cloud credentials.
 
 Verified on an MCP150 with ESP32-C3 Wi-Fi firmware `04D30Q29`: all nine HA
@@ -136,6 +137,14 @@ restoration after each. Native schedules and fault status stayed unchanged.
 Numeric controls were tested with neighboring values, not every possible value;
 encoding limits are covered by automated tests. This is evidence for this
 device/firmware, not all Jebao variants. Cloud/app verification remains manual.
+
+Also verified on an MDP10000 with ESP8266 firmware `04020B28`: power, feeding,
+motor speed and feed duration, with restoration after every change. It uses a
+302-byte status (301 writable bytes), a one-byte initial bitfield and eight
+attribute-mask bytes. Native clock bytes 5–12 and schedule bytes 13–300 are
+preserved. Its status lacks a DID, so each connection first validates its
+controller identity using a read-only UDP request. The MCP150 retains its
+401-byte status and two-byte initial bitfield.
 
 ```bash
 # Read status only (the default; no settings are written)
@@ -149,10 +158,14 @@ python3 scripts/mcp150_local.py 192.168.50.42 --test-flow --hold 10
 
 # WARNING: temporarily disables/restores the timer; tests power/feeding/linkage
 python3 scripts/mcp150_local.py 192.168.50.42 --test-all --hold 0.5
+
+# MDP10000: read only, then explicitly test/restore its four controls
+python3 scripts/mcp150_local.py 192.168.50.41
+python3 scripts/mcp150_local.py 192.168.50.41 --test-all --hold 0.5
 ```
 
 Each write flags only the selected attributes in the 64-bit mask, copying the
-current 400-byte writable block to preserve unselected values. The Flow-only
+current product-specific writable block to preserve unselected values. The Flow-only
 test checks unrelated bytes except the device clock. The full test checks
 schedules/faults and restores any related exposed settings the device changes.
 Both changes and restoration must also be confirmed over a separate TCP
@@ -170,9 +183,10 @@ the script reports success only after both changed and restored values are read.
 The device's native timer was found to overwrite a manual Flow change immediately:
 with `TimerON=true`, an immediate response showed 99 but independent reads showed
 100 again. With the timer off, 99 persisted across repeated independent reads.
-The Flow-only probe therefore refuses an enabled timer. The full probe disables
-it temporarily, tests all controls, and restores the user's original timer setting
-even after an error. Normal integration commands do **not** disable it
+The Flow-only MCP150 probe therefore refuses an enabled timer. Its full probe disables
+it temporarily and restores the original setting even after an error. The MDP10000's
+native timer is not exposed in its HA model: disable it in the app first if it is on;
+the probe will refuse rather than write unexposed settings. Normal commands do **not** disable it
 automatically. Turn off Timer in HA before manual control when necessary;
 cloud fallback cannot be assumed to defeat a native schedule.
 
@@ -183,6 +197,27 @@ status immediately, and resets LAN backoff after a successful local command.
 Unconfirmed local commands fall back to the existing cloud API; failure of both
 paths is a service error, not a successful update. Other product keys retain
 their existing cloud-control and LAN-polling paths.
+
+### Live availability checks
+
+Availability is separate from the cached attribute dictionary. After setup, a
+15-second timer runs bounded health checks independently of device polling/control
+locks. UDP unicast discovery acts as a read-only identity ping: only a complete
+Gizwits response from the expected IP/port with the expected DID is accepted.
+No motor command or cloud credential is sent by this ping.
+
+Failed/missing LAN pings trigger one batched cloud bindings query, bounded to five
+seconds, and only a freshly received boolean `is_online` counts as cloud health.
+Two unsuccessful checks mark all entities for that device unavailable; live
+evidence expires after 45 seconds. Cached cloud attributes do not count. Direct
+local responses reset health, and successful pings reset LAN backoff. Values are
+kept for recovery without keeping entities falsely available.
+
+The task cannot overlap itself, notifies every entity platform, and is cancelled
+and awaited before API/session cleanup on unload. Tests cover stale cache,
+cloud-only devices, cloud/UDP failures, individual-device isolation, recovery and
+all four entity platform states. Live testing confirmed both pumps' identity
+pings; missed checks were simulated without disconnecting either pump.
 
 ## 7. Authentication Flow
 
@@ -202,7 +237,7 @@ The integration authenticates with the Gizwits cloud API using email/password cr
 - **HTTP retries**: All cloud API requests are wrapped in `_api_request()` which retries up to 3 times with exponential backoff (1s, 2s, 4s) on connection errors or timeouts.
 - **Session recovery**: If the `aiohttp` session is closed or broken, `_ensure_session()` transparently recreates it before each request.
 - **Auth lock**: An `asyncio.Lock` ensures only one re-authentication runs at a time, even when multiple device polls trigger 401 simultaneously.
-- **Graceful degradation**: If re-auth fails, the coordinator preserves the last known device data so entities stay available with stale values rather than going unavailable.
+- **Graceful degradation**: Last-known values are retained after errors, but entities become unavailable when neither local nor fresh cloud health can be verified. Cached values never refresh availability.
 
 ### Key Classes
 

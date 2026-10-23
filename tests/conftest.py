@@ -206,6 +206,7 @@ def mock_api():
         return_value=MOCK_DEVICE_DATA[MOCK_DEVICE_ID].copy()
     )
     api.control_device = AsyncMock(return_value={"ok": True})
+    api.ping_device = AsyncMock(return_value=True)
     api.async_init_session = AsyncMock()
     api.close = AsyncMock()
     api.add_attribute_models = MagicMock()

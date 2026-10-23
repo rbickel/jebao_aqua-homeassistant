@@ -46,6 +46,11 @@ UPDATE_INTERVAL = timedelta(seconds=2)
 # Maximum consecutive LAN failures before falling back to cloud
 MAX_LAN_FAILURES = 3
 
+AVAILABILITY_INTERVAL = timedelta(seconds=15)
+AVAILABILITY_FAILURES = 2
+AVAILABILITY_TIMEOUT = 5.0
+AVAILABILITY_MAX_AGE = AVAILABILITY_INTERVAL.total_seconds() * 3
+
 # Platform types
 PLATFORMS = ["switch", "sensor", "select", "number"]
 

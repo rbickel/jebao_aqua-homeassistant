@@ -1,4 +1,4 @@
-"""Credential-free LAN protocol for the verified MCP150 product."""
+"""Credential-free LAN protocol for verified Jebao pump products."""
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,6 +24,41 @@ CONTROL_NAMES = frozenset({
 ControlValue = bool | int | float | str
 
 
+@dataclass(frozen=True)
+class ProductProfile:
+    product_key: str
+    name: str
+    writable_size: int
+    writable_attributes: int
+    bitfield_bytes: int
+    control_names: frozenset[str]
+    schedule_range: tuple[int, int]
+    clock_range: tuple[int, int]
+    identified_status: bool = True
+
+    @property
+    def status_size(self) -> int:
+        return self.writable_size + 1
+
+    @property
+    def flag_bytes(self) -> int:
+        return (self.writable_attributes + 7) // 8
+
+
+MCP150 = ProductProfile(
+    PRODUCT_KEY, "MCP150", 400, 64, 2, CONTROL_NAMES, (8, 392), (392, 400),
+)
+MDP10000 = ProductProfile(
+    "02039876751049deb404d1d89221ec4b", "MDP10000", 301, 59, 1,
+    frozenset({"SwitchON", "FeedSwitch", "Motor_Speed", "FeedTime"}),
+    (13, 301), (5, 13), identified_status=False,
+)
+PROFILES = {profile.product_key: profile for profile in (MCP150, MDP10000)}
+DISCOVERY_PORT = 12414
+DISCOVERY_REQUEST = bytes.fromhex("0000000303000003")
+PING_TIMEOUT = 3.0
+
+
 class ProbeError(Exception):
     """An unsupported response or failed verification."""
 
@@ -47,16 +82,30 @@ class Frame:
 class Status:
     device_id: str
     raw: bytes
+    profile: ProductProfile = MCP150
 
     def __post_init__(self) -> None:
-        if not self.device_id or len(self.raw) != STATUS_SIZE:
-            raise ProbeError("Expected a device ID and exactly 401 status bytes")
+        if not self.device_id or len(self.raw) != self.profile.status_size:
+            raise ProbeError(
+                f"Expected a device ID and exactly {self.profile.status_size} status bytes"
+            )
 
     @property
     def flow(self) -> int:
+        if self.profile != MCP150:
+            raise ProbeError("Flow is not a control on this product")
         return self.raw[FLOW_OFFSET]
 
     def summary(self) -> dict[str, int | bool]:
+        if self.profile == MDP10000:
+            return {
+                "SwitchON": bool(self.raw[0] & 1),
+                "FeedSwitch": bool(self.raw[0] & 4),
+                "Motor_Speed": self.raw[1],
+                "FeedTime": self.raw[2],
+                "TimerON": bool(self.raw[0] & 8),
+                "fault_bits": self.raw[self.profile.writable_size],
+            }
         bits = int.from_bytes(self.raw[:2], "big")
         return {
             "SwitchON": bool(bits & 1),
@@ -86,6 +135,57 @@ def encode_frame(command: int, payload: bytes = b"") -> bytes:
             return HEADER + encoded_length + body
 
 
+def decode_discovery_response(packet: bytes) -> str:
+    if not packet.startswith(HEADER):
+        raise ProbeError("Invalid discovery frame header")
+    index = len(HEADER)
+    length = 0
+    for shift in range(0, 28, 7):
+        if index >= len(packet):
+            raise ProbeError("Truncated discovery frame length")
+        byte = packet[index]
+        index += 1
+        length |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            break
+    else:
+        raise ProbeError("Invalid discovery frame length encoding")
+    body = packet[index:]
+    if length != len(body) or not 5 <= length <= MAX_FRAME_SIZE:
+        raise ProbeError("Invalid discovery frame size")
+    if body[0] != 0 or int.from_bytes(body[1:3], "big") != 4:
+        raise ProbeError("Unexpected discovery response command or flag")
+    did_length = int.from_bytes(body[3:5], "big")
+    if not 1 <= did_length <= 128 or 5 + did_length > len(body):
+        raise ProbeError("Invalid discovery device ID length")
+    try:
+        return body[5:5 + did_length].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ProbeError("Invalid discovery device ID") from error
+
+
+def discover_device(host: str, timeout: float = PING_TIMEOUT) -> str:
+    """Identify one controller using a read-only unicast protocol request."""
+    deadline = time.monotonic() + timeout
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+        connection.settimeout(timeout)
+        connection.sendto(DISCOVERY_REQUEST, (host, DISCOVERY_PORT))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out waiting for the device identity ping")
+            connection.settimeout(remaining)
+            packet, address = connection.recvfrom(MAX_FRAME_SIZE)
+            if address[0] == host and address[1] == DISCOVERY_PORT:
+                return decode_discovery_response(packet)
+
+
+def ping_device(host: str, device_id: str) -> bool:
+    if discover_device(host) != device_id:
+        raise ProbeError("Device identity ping answered by a different controller")
+    return True
+
+
 def parse_product_key(payload: bytes) -> str:
     if len(payload) < 52:
         raise ProbeError("Truncated device-info response")
@@ -97,12 +197,18 @@ def parse_product_key(payload: bytes) -> str:
     key = payload[offset + 2:offset + 2 + key_length]
     if key_length != 32 or len(key) != key_length:
         raise ProbeError("Invalid product key in device-info response")
-    if key != PRODUCT_KEY.encode("ascii"):
-        raise ProbeError("Refusing this device: product key is not the MCP150 test model")
-    return PRODUCT_KEY
+    try:
+        product_key = key.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ProbeError("Invalid product key encoding") from error
+    if product_key not in PROFILES:
+        raise ProbeError("Refusing this device: product key has not been verified")
+    return product_key
 
 
 def flow_control(status: Status, value: int) -> bytes:
+    if status.profile != MCP150:
+        raise InvalidCommand("Flow-only control is supported only for the MCP150")
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
         raise ProbeError("Flow must be an integer from 1 to 100; zero is not tested")
     writable = bytearray(status.raw[:WRITABLE_SIZE])
@@ -111,8 +217,9 @@ def flow_control(status: Status, value: int) -> bytes:
     return b"\x01" + FLOW_MASK + writable
 
 
-def supports_local_control(product_key: str, attributes: Mapping[str, ControlValue]) -> bool:
-    return product_key == PRODUCT_KEY and bool(attributes) and attributes.keys() <= CONTROL_NAMES
+def supports_local_control(product_key: str | None, attributes: Mapping[str, ControlValue]) -> bool:
+    profile = PROFILES.get(product_key) if product_key is not None else None
+    return profile is not None and bool(attributes) and attributes.keys() <= profile.control_names
 
 
 def normalize_attributes(
@@ -152,13 +259,16 @@ def control_payload(
     status: Status, attributes: Mapping[str, ControlValue], model: dict,
 ) -> bytes:
     normalized = normalize_attributes(attributes, model)
+    profile = status.profile
+    if model.get("product_key") != profile.product_key:
+        raise ProbeError("Device product does not match the configured model; no command sent")
     specs = {attr["name"]: attr for attr in model["attrs"]}
-    writable = bytearray(status.raw[:WRITABLE_SIZE])
+    writable = bytearray(status.raw[:profile.writable_size])
     flags = 0
     for name, value in normalized.items():
         attr = specs[name]
         attr_id = attr["id"]
-        if not isinstance(attr_id, int) or not 0 <= attr_id < 64:
+        if not isinstance(attr_id, int) or not 0 <= attr_id < profile.writable_attributes:
             raise InvalidCommand(f"Invalid attribute flag for {name}")
         flags |= 1 << attr_id
         position = attr["position"]
@@ -171,19 +281,23 @@ def control_payload(
             encoded = attr["enum"].index(value) if attr["data_type"] == "enum" else int(value)
             shift = position["bit_offset"]
             mask = ((1 << position["len"]) - 1) << shift
-            bits = int.from_bytes(writable[:2], "big")
-            writable[:2] = ((bits & ~mask) | (encoded << shift)).to_bytes(2, "big")
-    return b"\x01" + flags.to_bytes(8, "big") + writable
+            size = profile.bitfield_bytes
+            bits = int.from_bytes(writable[:size], "big")
+            writable[:size] = ((bits & ~mask) | (encoded << shift)).to_bytes(size, "big")
+    return b"\x01" + flags.to_bytes(profile.flag_bytes, "big") + writable
 
 
 def decode_status(status: Status, model: dict) -> dict[str, bool | int | str]:
+    if model.get("product_key") != status.profile.product_key:
+        raise ProbeError("Device status does not match the configured product")
     result = {}
     for attr in model["attrs"]:
         position = attr["position"]
         offset = position["byte_offset"]
         data_type = attr["data_type"]
         if data_type in ("bool", "enum"):
-            bits = int.from_bytes(status.raw[:2], "big") if offset == 0 else status.raw[offset]
+            size = status.profile.bitfield_bytes
+            bits = int.from_bytes(status.raw[:size], "big") if offset == 0 else status.raw[offset]
             value = (bits >> position["bit_offset"]) & ((1 << position["len"]) - 1)
             if data_type == "bool":
                 result[attr["name"]] = bool(value)
@@ -199,7 +313,10 @@ def decode_status(status: Status, model: dict) -> dict[str, bool | int | str]:
 
 
 def control_values(status: Status, model: dict) -> dict[str, bool | int | str]:
-    return {name: value for name, value in decode_status(status, model).items() if name in CONTROL_NAMES}
+    return {
+        name: value for name, value in decode_status(status, model).items()
+        if name in status.profile.control_names
+    }
 
 
 def verify_unchanged(before: Status, after: Status) -> None:
@@ -215,11 +332,13 @@ def verify_unchanged(before: Status, after: Status) -> None:
         raise ProbeError(f"Non-Flow status changed at byte offsets {changed}")
 
 
-class MCP150Client:
+class GizwitsLocalClient:
     def __init__(self, connection: socket.socket) -> None:
         self.connection = connection
         self.sequence = 0
         self.wifi_firmware = ""
+        self.profile = MCP150
+        self.device_id: str | None = None
 
     def _read_exact(self, count: int, deadline: float) -> bytes:
         result = bytearray()
@@ -274,8 +393,11 @@ class MCP150Client:
     def login(self) -> None:
         self._send(0x0013)
         info = self._response(0x0014)
-        parse_product_key(info.payload)
+        self.profile = PROFILES[parse_product_key(info.payload)]
         self.wifi_firmware = info.payload[8:16].decode("ascii", errors="replace")
+        if not self.profile.identified_status:
+            # Legacy status frames omit the DID; bind this session to a UDP identity reply.
+            self.device_id = discover_device(self.connection.getpeername()[0])
         self._send(0x0006)
         binding = self._response(0x0007).payload
         if len(binding) < 2 or int.from_bytes(binding[:2], "big") != len(binding) - 2:
@@ -292,19 +414,29 @@ class MCP150Client:
     def read_status(self, deadline: float | None = None) -> Status:
         sequence = self._send_data(b"\x02")
         frame = self._response(0x0094, sequence, deadline)
-        if frame.flag != 1 or len(frame.payload) < 7:
+        offset = 4
+        if frame.flag == 1:
+            if len(frame.payload) < 7:
+                raise ProbeError("Truncated identified status response")
+            did_length = int.from_bytes(frame.payload[4:6], "big")
+            offset = 6 + did_length
+            if not did_length or offset >= len(frame.payload):
+                raise ProbeError("Invalid device ID length in status response")
+            try:
+                device_id = frame.payload[6:offset].decode("ascii")
+            except UnicodeDecodeError as error:
+                raise ProbeError("Invalid device ID in status response") from error
+            if self.device_id is not None and device_id != self.device_id:
+                raise ProbeError("Status and discovery identities do not match")
+        elif frame.flag == 0 and not self.profile.identified_status and self.device_id:
+            device_id = self.device_id
+            if offset >= len(frame.payload):
+                raise ProbeError("Truncated legacy status response")
+        else:
             raise ProbeError("Expected an identified status response")
-        did_length = int.from_bytes(frame.payload[4:6], "big")
-        offset = 6 + did_length
-        if not did_length or offset >= len(frame.payload):
-            raise ProbeError("Invalid device ID length in status response")
-        try:
-            device_id = frame.payload[6:offset].decode("ascii")
-        except UnicodeDecodeError as error:
-            raise ProbeError("Invalid device ID in status response") from error
         if frame.payload[offset] != 3:
             raise ProbeError("Expected a status-read response (P0 action 0x03)")
-        return Status(device_id, frame.payload[offset + 1:])
+        return Status(device_id, frame.payload[offset + 1:], self.profile)
 
     def write_flow(self, status: Status, value: int) -> None:
         self._send_data(flow_control(status, value))
@@ -344,10 +476,13 @@ class MCP150Client:
             time.sleep(0.2)
 
 
+MCP150Client = GizwitsLocalClient
+
+
 @contextmanager
-def connect(host: str) -> Generator[MCP150Client, None, None]:
+def connect(host: str) -> Generator[GizwitsLocalClient, None, None]:
     with socket.create_connection((host, PORT), timeout=TIMEOUT) as connection:
-        client = MCP150Client(connection)
+        client = GizwitsLocalClient(connection)
         client.login()
         yield client
 

@@ -1,7 +1,9 @@
 import asyncio
 import json
+import time
+from typing import Callable
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.config_entries import ConfigEntries  # Add this import
@@ -9,8 +11,12 @@ import async_timeout
 from pathlib import Path
 from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
 from homeassistant.helpers.device_registry import async_get as async_get_device_registry
+from homeassistant.helpers.event import async_track_time_interval
 
-from .const import DOMAIN, PLATFORMS, UPDATE_INTERVAL, LOGGER, GIZWITS_API_URLS, MAX_LAN_FAILURES
+from .const import (
+    DOMAIN, PLATFORMS, UPDATE_INTERVAL, LOGGER, GIZWITS_API_URLS, MAX_LAN_FAILURES,
+    AVAILABILITY_INTERVAL, AVAILABILITY_FAILURES, AVAILABILITY_TIMEOUT, AVAILABILITY_MAX_AGE,
+)
 from .api import GizwitsApi, AuthenticationError
 from .discovery import discover_devices
 from .helpers import is_device_data_valid  # Add this import
@@ -152,6 +158,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     # Replace multiple async_forward_entry_setup calls with single async_forward_entry_setups
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    coordinator.async_start_availability_checks(entry)
 
     return True
 
@@ -165,6 +172,125 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
         self.device_data = {}
         self._device_update_locks = {}  # Add locks per device
         self._lan_failure_counts = {}  # Track consecutive LAN failures per device
+        self._last_device_seen: dict[str, float] = {}
+        self._availability_failures: dict[str, int] = {}
+        self._availability_unsub: Callable[[], None] | None = None
+        self._availability_task: asyncio.Task[None] | None = None
+        self._availability_stopped = False
+
+    def _mark_device_seen(self, device_id: str) -> None:
+        self._last_device_seen[device_id] = time.monotonic()
+        self._availability_failures[device_id] = 0
+
+    def is_device_available(self, device_id: str) -> bool:
+        last_seen = self._last_device_seen.get(device_id)
+        return (
+            is_device_data_valid(self.device_data.get(device_id))
+            and last_seen is not None
+            and time.monotonic() - last_seen <= AVAILABILITY_MAX_AGE
+            and self._availability_failures.get(device_id, 0) < AVAILABILITY_FAILURES
+        )
+
+    @callback
+    def async_start_availability_checks(self, entry: ConfigEntry) -> None:
+        if self._availability_unsub is not None:
+            return
+        self._availability_stopped = False
+        self._availability_unsub = async_track_time_interval(
+            self.hass, self._async_schedule_availability, AVAILABILITY_INTERVAL,
+        )
+        entry.async_on_unload(self._cancel_availability_checks)
+        self._async_schedule_availability()
+
+    @callback
+    def _async_schedule_availability(self, _now=None) -> None:
+        if self._availability_stopped or (
+            self._availability_task is not None and not self._availability_task.done()
+        ):
+            return
+        self._availability_task = self.hass.async_create_task(self._async_run_availability())
+
+    async def _async_run_availability(self) -> None:
+        try:
+            await self.async_check_availability()
+        finally:
+            self._availability_task = None
+
+    @callback
+    def _cancel_availability_checks(self) -> None:
+        self._availability_stopped = True
+        if self._availability_unsub is not None:
+            self._availability_unsub()
+            self._availability_unsub = None
+        if self._availability_task is not None:
+            self._availability_task.cancel()
+
+    async def async_stop_availability_checks(self) -> None:
+        task = self._availability_task
+        self._cancel_availability_checks()
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            if self._availability_task is task:
+                self._availability_task = None
+
+    async def async_check_availability(self) -> None:
+        """Probe live reachability independently of slow status polling and cached data."""
+        if self._availability_stopped:
+            return
+        devices = [device for device in self.device_inventory if device.get("did")]
+
+        async def local_check(device: dict) -> bool:
+            if not device.get("lan_ip"):
+                return False
+            try:
+                return await asyncio.wait_for(
+                    self.api.ping_device(device["lan_ip"], device["did"]),
+                    timeout=AVAILABILITY_TIMEOUT,
+                ) is True
+            except (OSError, LocalControlError) as error:
+                LOGGER.debug("Availability ping failed for %s: %s", device["did"], error)
+                return False
+
+        local_online = await asyncio.gather(*(local_check(device) for device in devices))
+        cloud_online = set()
+        if devices and not all(local_online):
+            try:
+                response = await asyncio.wait_for(
+                    self.api.get_devices(), timeout=AVAILABILITY_TIMEOUT,
+                )
+            except (AuthenticationError, OSError) as error:
+                LOGGER.warning("Cloud availability check failed: %s", error)
+            else:
+                if not isinstance(response, dict) or not isinstance(response.get("devices"), list):
+                    LOGGER.warning("Cloud availability check returned no valid device inventory")
+                else:
+                    for device in response["devices"]:
+                        if not isinstance(device, dict) or not device.get("did"):
+                            LOGGER.warning("Ignoring malformed device in cloud availability response")
+                            continue
+                        online = device.get("is_online")
+                        if not isinstance(online, bool):
+                            LOGGER.warning("Cloud online status missing or invalid for %s", device["did"])
+                        elif online:
+                            cloud_online.add(device["did"])
+        if self._availability_stopped:
+            return
+        for device, online in zip(devices, local_online):
+            device_id = device["did"]
+            was_available = self.is_device_available(device_id)
+            if online or device_id in cloud_online:
+                self._mark_device_seen(device_id)
+                if online:
+                    self._lan_failure_counts[device_id] = 0
+            else:
+                self._availability_failures[device_id] = self._availability_failures.get(device_id, 0) + 1
+            available = self.is_device_available(device_id)
+            if was_available != available:
+                LOGGER.info("Device %s is now %s", device_id, "available" if available else "unavailable")
+        self.async_update_listeners()
 
     async def fetch_initial_device_list(self, entry: ConfigEntry):
         """Fetch the initial list of devices and add LAN IPs."""
@@ -183,6 +309,8 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                     )
                     if matching_device:
                         device["lan_ip"] = matching_device.get("lan_ip")
+                    if device_id and device.get("is_online") is True:
+                        self._mark_device_seen(device_id)
 
                 LOGGER.debug(
                     f"Fetched device list with LAN IPs: {self.device_inventory}"
@@ -223,6 +351,8 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                 if data:
                     # LAN success — reset failure counter
                     self._lan_failure_counts[device_id] = 0
+                    if is_device_data_valid(data) and data.get("did") == device_id:
+                        self._mark_device_seen(device_id)
                 else:
                     # LAN failed — increment counter
                     self._lan_failure_counts[device_id] = lan_failures + 1
@@ -284,6 +414,7 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                 else:
                     if is_device_data_valid(data) and data.get("did") == device_id:
                         self._lan_failure_counts[device_id] = 0
+                        self._mark_device_seen(device_id)
                         self.device_data = {**self.device_data, device_id: data}
                         self.async_set_updated_data(self.device_data)
                         LOGGER.debug("Command confirmed locally for %s", device_id)
@@ -351,7 +482,7 @@ class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
                         f"Successfully updated device {device_id} with data: {data}"
                     )
                 elif device_id and device_id in self.device_data:
-                    # Preserve last known good data so entity stays available
+                    # Retain attributes for recovery; live availability is tracked separately.
                     new_data[device_id] = self.device_data[device_id]
                     LOGGER.warning(
                         f"Preserving cached data for device {device_id}"
@@ -383,6 +514,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
         if unload_ok:
+            entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+            if entry_data:
+                await entry_data["coordinator"].async_stop_availability_checks()
             # Clean up the entity registry
             ent_reg = async_get_entity_registry(hass)
             entities = [
